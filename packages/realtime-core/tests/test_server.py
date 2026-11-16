@@ -14,6 +14,28 @@ class FakeWebSocket:
         self.messages.append(json.loads(raw))
 
 
+class ActiveCallLimitTests(unittest.TestCase):
+    def setUp(self):
+        self.original_calls = server.CALLS.copy()
+        server.CALLS.clear()
+
+    def tearDown(self):
+        server.CALLS.clear()
+        server.CALLS.update(self.original_calls)
+
+    def test_only_one_active_call_per_account(self):
+        call = server.Call()
+        call.user_id = "account-123"
+        server.CALLS[call.id] = call
+
+        self.assertTrue(server.has_active_call_for_user("account-123"))
+        self.assertFalse(server.has_active_call_for_user("another-account"))
+        self.assertFalse(server.has_active_call_for_user(""))
+
+        call.ended = True
+        self.assertFalse(server.has_active_call_for_user("account-123"))
+
+
 class BrowserReplyTests(unittest.IsolatedAsyncioTestCase):
     async def wait_for_pending_reply(self, call):
         for _ in range(100):
