@@ -89,6 +89,45 @@ class BrowserReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.pending_replies, {})
         self.assertFalse(any(message.get("type") == "transcript" for message in call.ws.messages))
 
+    async def test_proactive_turn_requests_app_reply_and_plays_it(self):
+        call = server.Call()
+        call.ws = FakeWebSocket()
+
+        with (
+            patch.object(server, "ADAPTER_URL", ""),
+            patch.object(server, "synthesize", new=AsyncMock(return_value=None)),
+            patch.object(server, "request_reply", new=AsyncMock(side_effect=AssertionError("adapter should not be called"))),
+        ):
+            task = asyncio.create_task(server.proactive_turn(None, call, None))
+            turn_id, future = await self.wait_for_pending_reply(call)
+            self.assertTrue(any(message.get("type") == "proactive_turn" for message in call.ws.messages))
+            future.set_result("早上好，该起床啦。")
+            await task
+
+        reply = next(message for message in call.ws.messages if message.get("type") == "reply_text")
+        self.assertEqual(reply["turn_id"], turn_id)
+        self.assertEqual(reply["text"], "早上好，该起床啦。")
+        self.assertNotIn(turn_id, call.pending_replies)
+
+    async def test_interrupted_proactive_turn_does_not_send_stale_reply(self):
+        call = server.Call()
+        call.ws = FakeWebSocket()
+
+        with (
+            patch.object(server, "ADAPTER_URL", ""),
+            patch.object(server, "synthesize", new=AsyncMock(return_value=None)),
+        ):
+            task = asyncio.create_task(server.proactive_turn(None, call, None))
+            turn_id, future = await self.wait_for_pending_reply(call)
+            call.interrupts += 1
+            future.cancel()
+            await task
+
+        types = [message.get("type") for message in call.ws.messages]
+        self.assertIn("proactive_turn", types)
+        self.assertNotIn("reply_text", types)
+        self.assertNotIn(turn_id, call.pending_replies)
+
     async def test_browser_reply_timeout_notifies_the_client(self):
         call = server.Call()
         call.ws = FakeWebSocket()
