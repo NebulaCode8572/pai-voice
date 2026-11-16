@@ -89,6 +89,25 @@ class BrowserReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.pending_replies, {})
         self.assertFalse(any(message.get("type") == "transcript" for message in call.ws.messages))
 
+    async def test_browser_reply_timeout_notifies_the_client(self):
+        call = server.Call()
+        call.ws = FakeWebSocket()
+
+        with (
+            patch.object(server, "ADAPTER_URL", ""),
+            patch.object(server, "transcribe", new=AsyncMock(return_value="你好")),
+            patch.object(server.asyncio, "wait_for", new=AsyncMock(side_effect=asyncio.TimeoutError)),
+        ):
+            await server.answer_turn(None, call, None, b"audio")
+
+        timeout_event = next(
+            message for message in call.ws.messages
+            if message.get("type") == "reply_timeout"
+        )
+        self.assertTrue(timeout_event["turn_id"])
+        self.assertTrue(any(message.get("type") == "error" for message in call.ws.messages))
+        self.assertEqual(call.pending_replies, {})
+
     async def test_interrupted_turn_does_not_send_stale_reply(self):
         call = server.Call()
         call.ws = FakeWebSocket()
