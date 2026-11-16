@@ -12,24 +12,43 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import ipaddress
 import json
 import os
 import time
 import uuid
 import wave
 from dataclasses import dataclass, field
+from http import HTTPStatus
 
 import aiohttp
 
+from auth import verify_ticket
 from vision import DIFF_THRESHOLD, Eyes
-import numpy as np
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 SAMPLE_RATE = 16_000
 HOST = os.getenv("PAIVOICE_HOST", "127.0.0.1")
-PORT = int(os.getenv("PAIVOICE_PORT", "8780"))
-TOKEN = os.getenv("PAIVOICE_TOKEN", "")
+PORT = int(os.getenv("PAIVOICE_PORT") or os.getenv("PORT", "8780"))
+AUTH_SECRET = os.getenv("PAIVOICE_AUTH_SECRET", "")
+ALLOW_INSECURE_LOCAL = os.getenv("PAIVOICE_ALLOW_INSECURE_LOCAL", "").lower() in ("1", "true", "yes")
+ALLOWED_ORIGINS = [x.strip() for x in os.getenv("PAIVOICE_ALLOWED_ORIGINS", "").split(",") if x.strip()]
+VIDEO_ENABLED = os.getenv("PAIVOICE_ENABLE_VIDEO", "false").lower() in ("1", "true", "yes")
+USED_TICKETS: dict[str, int] = {}
+
+if AUTH_SECRET and len(AUTH_SECRET.encode("utf-8")) < 32:
+    raise RuntimeError("PAIVOICE_AUTH_SECRET must contain at least 32 bytes")
+if not AUTH_SECRET:
+    if not ALLOW_INSECURE_LOCAL:
+        raise RuntimeError("PAIVOICE_AUTH_SECRET is required; see docs/VPS-DEPLOYMENT.md")
+    try:
+        is_loopback = HOST == "localhost" or ipaddress.ip_address(HOST).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        raise RuntimeError("Insecure local mode is only allowed on a loopback bind")
+
 ASR_PROVIDER = os.getenv("PAIVOICE_ASR_PROVIDER", "mock")
 TTS_PROVIDER = os.getenv("PAIVOICE_TTS_PROVIDER", "mock")
 ASR_KEY = os.getenv("PAIVOICE_ASR_API_KEY") or os.getenv("GROQ_API_KEY", "")
@@ -174,6 +193,7 @@ class Call:
     detached_at: float = 0.0                  # 连接断开的时间（等接回中）
     end_task: object = None                   # 等接回的倒计时
     ended: bool = False
+    user_id: str = ""
     watch_title: str = ""                     # 一起看电影：前端告诉的片名；空 = 普通屏幕共享
     interrupts: int = 0                       # 对方开口打断的次数：只停正在念的那句，排着的照念
     speak_lock: asyncio.Lock = field(default_factory=asyncio.Lock)   # 回复一句一句按顺序念，后到的不顶掉先到的
@@ -186,10 +206,22 @@ class Call:
         self.active = True
         self.audio.clear()
 
+    def append_audio(self, chunk: bytes) -> None:
+        """Keep at most MAX_TURN_SECONDS of PCM in memory per call."""
+        if not self.active or not chunk:
+            return
+        max_bytes = SAMPLE_RATE * 2 * MAX_TURN_SECONDS
+        if len(chunk) >= max_bytes:
+            self.audio = bytearray(chunk[-max_bytes:])
+            return
+        overflow = len(self.audio) + len(chunk) - max_bytes
+        if overflow > 0:
+            del self.audio[:overflow]
+        self.audio.extend(chunk)
+
     def end_turn(self) -> bytes:
         self.active = False
-        max_bytes = SAMPLE_RATE * 2 * MAX_TURN_SECONDS
-        return bytes(self.audio[-max_bytes:])
+        return bytes(self.audio)
 
 
 SCREEN_INTRO = ("对方共享了屏幕，可能在看剧、玩游戏或看网页，想和你一起看。大约每 {secs} 秒来一条 screen 事件："
@@ -362,23 +394,50 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
 async def session(ws) -> None:
     call = Call()
     explicit = False
+    authenticated = False
+    user_id = ""
     async with aiohttp.ClientSession() as http:
         try:
             async for raw in ws:
                 if isinstance(raw, bytes):
-                    if call.active:
-                        call.audio.extend(raw)
+                    if not authenticated:
+                        await ws.close(code=4401, reason="authentication required")
+                        return
+                    call.append_audio(raw)
                     continue
                 try:
                     event = json.loads(raw)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, TypeError):
                     continue
                 kind = event.get("type")
+                first_start = False
+                if not authenticated:
+                    if kind != "start":
+                        await send(ws, {"type": "error", "error": "Authentication must be the first message"})
+                        await ws.close(code=4401, reason="authentication required")
+                        return
+                    if AUTH_SECRET:
+                        try:
+                            claims = verify_ticket(event.get("ticket", ""), AUTH_SECRET, used_jti=USED_TICKETS)
+                        except ValueError:
+                            await send(ws, {"type": "error", "error": "Unauthorized"})
+                            await ws.close(code=4401, reason="invalid ticket")
+                            return
+                        user_id = claims["sub"]
+                    else:
+                        user_id = "local-development"
+                    authenticated = True
+                    first_start = True
                 if kind == "start":
-                    if TOKEN and event.get("token") != TOKEN:
-                        await send(ws, {"type": "error", "error": "Unauthorized"})
+                    if not first_start:
+                        await send(ws, {"type": "error", "error": "A call is already started on this connection"})
                         return
                     old = CALLS.get(str(event.get("resume") or ""))
+                    if old is not None and not old.ended:
+                        if old.user_id != user_id:
+                            await send(ws, {"type": "error", "error": "Resume is not authorized"})
+                            await ws.close(code=4403, reason="resume not authorized")
+                            return
                     if old is not None and not old.ended:
                         # 断线接回：接着同一通，摄像头 / 屏幕共享 / 片名这些状态都在 old 上。
                         # 旧连接还挂着（手机先连上新的、旧的还没断）：新连接接管，旧连接关掉、不算挂断
@@ -399,9 +458,12 @@ async def session(ws) -> None:
                         await notify_adapter(http, {"type": "call_resumed", "call_session_id": call.id, "gap_s": gap})
                     else:
                         call.ws = ws
+                        call.user_id = user_id
                         CALLS[call.id] = call
                         await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening"})
                         await notify_adapter(http, {"type": "call_start", "call_session_id": call.id})   # 来电接通：先告诉回复端
+                elif kind in ("video", "watch", "video_mode", "frame") and not VIDEO_ENABLED:
+                    await send(ws, {"type": "feature_disabled", "feature": "video"})
                 elif kind == "speech_start":
                     call.begin_turn()
                 elif kind == "speech_end":
@@ -491,8 +553,24 @@ async def session(ws) -> None:
             # call.ws 已经是别的连接：被新连接接管了，什么都不做
 
 
+async def health_check(connection, request):
+    """Minimal HTTP health endpoint for reverse proxies and service monitors."""
+    if request.path == "/healthz":
+        return connection.respond(HTTPStatus.OK, "OK\\n")
+
+
 async def main() -> None:
-    async with serve(session, HOST, PORT, max_size=None):
+    async with serve(
+        session,
+        HOST,
+        PORT,
+        origins=ALLOWED_ORIGINS or None,
+        process_request=health_check,
+        max_size=1_048_576,
+        max_queue=16,
+        ping_interval=20,
+        ping_timeout=20,
+    ):
         print(f"PaiVoice listening on ws://{HOST}:{PORT}")
         await asyncio.Future()
 
