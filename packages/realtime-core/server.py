@@ -374,7 +374,7 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
         if not transcript:
             await send(call.ws, {"type": "nothing_heard"})
             return
-        if call.interrupts != heard:
+        if call.ended or call.interrupts != heard:
             return
         # 先登记 Future 再发 transcript，避免浏览器端模型很快返回时发生竞态。
         reply_future = asyncio.get_running_loop().create_future()
