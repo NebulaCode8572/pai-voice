@@ -87,7 +87,7 @@ After ASR, the core sends a `transcript` event containing `turn_id` and `text`, 
 {"type":"client_reply","turn_id":"<turn-id-from-transcript>","text":"<generated-character-reply>"}
 ```
 
-The core returns the reply text and synthesized audio over the same WebSocket. If the browser reply times out and `PAIVOICE_ADAPTER_URL` is configured, the core falls back to that server-side Adapter. Interrupting a turn cancels its pending browser reply so an outdated response is not spoken after the user starts a new turn.
+The core returns the reply text and synthesized audio over the same WebSocket. If the browser reply times out, the core emits a `reply_timeout` event containing the `turn_id`; the App should cancel any matching in-flight generation. If `PAIVOICE_ADAPTER_URL` is configured, the core then falls back to that server-side Adapter. Interrupting a turn cancels its pending browser reply so an outdated response is not spoken after the user starts a new turn.
 
 The browser must only receive short-lived tickets. The HMAC signing secret remains on the trusted App server and the PaiVoice service.
 
