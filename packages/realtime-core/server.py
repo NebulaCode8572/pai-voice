@@ -431,6 +431,63 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
             await send(call.ws, {"type": "state", "mode": "listening"})
 
 
+async def proactive_turn(ws, call: Call, http: aiohttp.ClientSession) -> None:
+    """Ask the connected App to generate a character-initiated first utterance."""
+    turn_id = uuid.uuid4().hex
+    heard = call.interrupts
+    reply_future = asyncio.get_running_loop().create_future()
+    call.pending_replies[turn_id] = reply_future
+    cancelled = False
+    try:
+        await send(call.ws, {"type": "state", "mode": "thinking"})
+        await send(call.ws, {"type": "proactive_turn", "call_session_id": call.id, "turn_id": turn_id})
+        try:
+            reply = await asyncio.wait_for(reply_future, timeout=120)
+        except asyncio.TimeoutError:
+            await send(call.ws, {"type": "reply_timeout", "turn_id": turn_id})
+            if not ADAPTER_URL:
+                raise RuntimeError("App proactive reply timed out")
+            reply = await request_reply(http, {
+                "call_session_id": call.id,
+                "turn_id": turn_id,
+                "transcript": "",
+                "proactive": True,
+            })
+
+        if call.ended or call.interrupts != heard or not reply:
+            return
+
+        async with call.speak_lock:
+            if call.ended or call.interrupts != heard:
+                return
+            call.generation += 1
+            generation = call.generation
+            await send(call.ws, {
+                "type": "reply_text",
+                "generation_id": generation,
+                "turn_id": turn_id,
+                "text": reply,
+            })
+            audio = await synthesize(http, reply)
+            if audio and call.interrupts == heard:
+                await send(call.ws, {
+                    "type": "audio",
+                    "generation_id": generation,
+                    "data": base64.b64encode(audio).decode("ascii"),
+                })
+                await send(call.ws, {"type": "audio_sentence_end", "generation_id": generation})
+            await send(call.ws, {"type": "generation_end", "generation_id": generation})
+    except asyncio.CancelledError:
+        cancelled = True
+    except Exception as error:
+        await send(call.ws, {"type": "error", "error": str(error)})
+    finally:
+        if call.pending_replies.get(turn_id) is reply_future:
+            call.pending_replies.pop(turn_id, None)
+        if not cancelled and not call.ended:
+            await send(call.ws, {"type": "state", "mode": "listening"})
+
+
 async def session(ws) -> None:
     call = Call()
     explicit = False
@@ -520,6 +577,9 @@ async def session(ws) -> None:
                 elif kind == "text":
                     await send(ws, {"type": "state", "mode": "thinking"})
                     asyncio.create_task(answer_turn(ws, call, http, b"", str(event.get("text", ""))))
+                elif kind == "proactive":
+                    if not call.ended:
+                        asyncio.create_task(proactive_turn(ws, call, http))
                 elif kind == "client_reply":
                     turn_id = str(event.get("turn_id") or "")
                     reply_text = event.get("text")
