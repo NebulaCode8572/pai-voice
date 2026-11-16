@@ -14,7 +14,7 @@ Do not expose the raw Python port directly to the public Internet. Production We
 
 ## Authentication model
 
-Production requires `PAIVOICE_AUTH_SECRET` (at least 32 bytes). Generate a value with `openssl rand -hex 32`; never use the example placeholder or commit the generated value. The secret is shared only between PaiVoice and a trusted server-side component in your App. Never put it in browser JavaScript, PWA configuration, or a mobile bundle.
+Production requires `PAIVOICE_AUTH_SECRET` (at least 32 bytes) and `PAIVOICE_ALLOWED_ORIGINS` containing the exact App origin(s). The service refuses to start in authenticated mode if the origin list is empty or contains `*`. Generate a secret with `openssl rand -hex 32`; never use the example placeholder or commit the generated value. The secret is shared only between PaiVoice and a trusted server-side component in your App. Never put it in browser JavaScript, PWA configuration, or a mobile bundle.
 
 Before opening each WebSocket connection, the App backend issues a short-lived ticket and returns it to the authenticated user. The browser passes that ticket in the first `start` message:
 
