@@ -40,7 +40,11 @@ def verify_ticket(
     if len(parts) != 2:
         raise ValueError("Malformed ticket")
     encoded_payload, encoded_signature = parts
-    expected = hmac.new(secret.encode("utf-8"), encoded_payload.encode("ascii"), hashlib.sha256).digest()
+    try:
+        signed_bytes = encoded_payload.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("Malformed ticket") from exc
+    expected = hmac.new(secret.encode("utf-8"), signed_bytes, hashlib.sha256).digest()
     supplied = _b64url_decode(encoded_signature)
     if not hmac.compare_digest(expected, supplied):
         raise ValueError("Invalid ticket signature")
