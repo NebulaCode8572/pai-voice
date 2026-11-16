@@ -328,6 +328,13 @@ async def send(ws, message: dict) -> None:
         pass
 
 
+def has_active_call_for_user(user_id: str) -> bool:
+    """The App exposes one active call per account; enforce the same limit at the service."""
+    if not user_id:
+        return False
+    return any(not call.ended and call.user_id == user_id for call in CALLS.values())
+
+
 async def end_call(call: "Call", http: aiohttp.ClientSession | None, reason: str) -> None:
     """真挂了：挂断键，或者断线后 RESUME_WINDOW 秒没接回。只走一次。"""
     if call.ended:
@@ -487,6 +494,10 @@ async def session(ws) -> None:
                                         "video": call.video, "video_mode": call.video_mode, "watch_title": call.watch_title})
                         await notify_adapter(http, {"type": "call_resumed", "call_session_id": call.id, "gap_s": gap})
                     else:
+                        if has_active_call_for_user(user_id):
+                            await send(ws, {"type": "error", "error": "This account already has an active call"})
+                            await ws.close(code=4409, reason="active call limit reached")
+                            return
                         call.ws = ws
                         call.user_id = user_id
                         CALLS[call.id] = call
