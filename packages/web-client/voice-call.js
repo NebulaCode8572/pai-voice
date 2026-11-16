@@ -48,10 +48,12 @@ registerProcessor('pcm-capture', PcmCapture);
 const MIC_CONSTRAINTS = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
 
 export class VoiceCall {
-  constructor({ url, video = false, on = {}, vad = {} } = {}) {
+  constructor({ url, video = false, on = {}, vad = {}, getAuthTicket = null } = {}) {
     this.url = url;
     this.wantVideo = video;
     this.on = on;
+    this.getAuthTicket = getAuthTicket;
+    this.authTicket = null;
     this.vad = Object.assign({
       startHold: 3,        // 连续几块（~20ms/块）超阈值算开口
       endSilenceMs: 650,   // 静音多久算说完
@@ -136,12 +138,20 @@ export class VoiceCall {
     }
 
     await this._connect();
-    this._send({ type: 'start', video: this.wantVideo, sample_rate: 16000 });
+    this._send({ type: 'start', ticket: this.authTicket || undefined, video: this.wantVideo, sample_rate: 16000 });
     this._setMode('listening');
     if (this.video) this._startFrames();
   }
 
-  _connect() {
+  async _connect() {
+    // Obtain a fresh, short-lived, single-use ticket from the trusted App backend.
+    // The long-lived HMAC signing secret must never be present in this browser client.
+    this.authTicket = typeof this.getAuthTicket === 'function'
+      ? await this.getAuthTicket()
+      : null;
+    if (typeof this.getAuthTicket === 'function' && (!this.authTicket || typeof this.authTicket !== 'string')) {
+      throw new Error('通话授权凭证无效');
+    }
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.url);
       ws.binaryType = 'arraybuffer';
@@ -171,7 +181,7 @@ export class VoiceCall {
     while (!this._hungUp && Date.now() < deadline) {
       try {
         await this._connect();
-        this._send({ type: 'start', resume: this.callSessionId, video: !!this.video, sample_rate: 16000 });
+        this._send({ type: 'start', ticket: this.authTicket || undefined, resume: this.callSessionId, video: !!this.video, sample_rate: 16000 });
         this._reconnecting = false;
         this._setMode('listening');
         this.emit('resumed');
