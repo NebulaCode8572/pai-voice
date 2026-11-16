@@ -556,7 +556,7 @@ async def session(ws) -> None:
 async def health_check(connection, request):
     """Minimal HTTP health endpoint for reverse proxies and service monitors."""
     if request.path == "/healthz":
-        return connection.respond(HTTPStatus.OK, "OK\\n")
+        return connection.respond(HTTPStatus.OK, "OK\n")
 
 
 async def main() -> None:
