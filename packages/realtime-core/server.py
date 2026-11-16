@@ -579,7 +579,7 @@ async def session(ws) -> None:
                     asyncio.create_task(answer_turn(ws, call, http, b"", str(event.get("text", ""))))
                 elif kind == "proactive":
                     # If the user has already started speaking, their turn takes priority.
-                    if not call.ended and not call.active and call.interrupts == 0:
+                    if not call.ended and not call.active:
                         asyncio.create_task(proactive_turn(ws, call, http))
                 elif kind == "client_reply":
                     turn_id = str(event.get("turn_id") or "")
