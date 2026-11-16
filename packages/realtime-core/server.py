@@ -409,6 +409,8 @@ async def session(ws) -> None:
                     event = json.loads(raw)
                 except (json.JSONDecodeError, TypeError):
                     continue
+                if not isinstance(event, dict):
+                    continue
                 kind = event.get("type")
                 first_start = False
                 if not authenticated:
