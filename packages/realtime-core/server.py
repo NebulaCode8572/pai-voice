@@ -196,6 +196,7 @@ class Call:
     user_id: str = ""
     watch_title: str = ""                     # 一起看电影：前端告诉的片名；空 = 普通屏幕共享
     interrupts: int = 0                       # 对方开口打断的次数：只停正在念的那句，排着的照念
+    pending_replies: dict[str, asyncio.Future] = field(default_factory=dict)  # 等待浏览器端 LLM 返回的回合
     speak_lock: asyncio.Lock = field(default_factory=asyncio.Lock)   # 回复一句一句按顺序念，后到的不顶掉先到的
 
     def companion_reset(self) -> None:
@@ -332,6 +333,10 @@ async def end_call(call: "Call", http: aiohttp.ClientSession | None, reason: str
     if call.ended:
         return
     call.ended = True
+    for future in list(call.pending_replies.values()):
+        if not future.done():
+            future.cancel()
+    call.pending_replies.clear()
     CALLS.pop(call.id, None)
     if call.end_task and call.end_task is not asyncio.current_task():
         call.end_task.cancel()
@@ -361,22 +366,38 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
         await send(call.ws, {"type": "nothing_heard"})
         return
     turn_id = uuid.uuid4().hex
+    heard = call.interrupts
+    reply_future = None
+    cancelled = False
     try:
         transcript = supplied_text or await transcribe(http, pcm)
         if not transcript:
             await send(call.ws, {"type": "nothing_heard"})
             return
+        # 先登记 Future 再发 transcript，避免浏览器端模型很快返回时发生竞态。
+        reply_future = asyncio.get_running_loop().create_future()
+        call.pending_replies[turn_id] = reply_future
         await send(call.ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
         turn = {"call_session_id": call.id, "turn_id": turn_id, "transcript": transcript}
         if call.video and call.eyes.last_observation:
             turn["observation"] = call.eyes.last_observation      # 最近一次看到的画面，随这轮一起给回复端
-        reply = await request_reply(http, turn)
-        if not reply:
+
+        # App 端沿用它现有的浏览器侧聊天引擎生成角色回复，再把结果回传。
+        # 若浏览器端未能返回，才回退到可选的服务端 Adapter。
+        try:
+            reply = await asyncio.wait_for(reply_future, timeout=120)
+        except asyncio.TimeoutError:
+            if not ADAPTER_URL:
+                raise RuntimeError("App reply timed out")
+            reply = await request_reply(http, turn)
+
+        if call.interrupts != heard or not reply:
             return
-        # 不掐掉：对方连着说了几句，每句各自去问回复端；回来的话排队，按到达顺序一句一句念完。
-        # 只有对方开口打断（interrupt）才停——而且只停当时正在念的那句，后面排着的照念。
+
+        # 不掐掉：对方连着说了几句，每句各自生成；回来的话排队，按到达顺序一句一句念完。
         async with call.speak_lock:
-            heard = call.interrupts
+            if call.interrupts != heard or call.ended:
+                return
             call.generation += 1
             generation = call.generation
             await send(call.ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": reply})
@@ -385,10 +406,15 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
                 await send(call.ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
                 await send(call.ws, {"type": "audio_sentence_end", "generation_id": generation})
             await send(call.ws, {"type": "generation_end", "generation_id": generation})
+    except asyncio.CancelledError:
+        cancelled = True
     except Exception as error:  # do not serialize credentials or provider bodies
         await send(call.ws, {"type": "error", "error": str(error)})
     finally:
-        await send(call.ws, {"type": "state", "mode": "listening"})
+        if reply_future is not None and call.pending_replies.get(turn_id) is reply_future:
+            call.pending_replies.pop(turn_id, None)
+        if not cancelled:
+            await send(call.ws, {"type": "state", "mode": "listening"})
 
 
 async def session(ws) -> None:
@@ -476,9 +502,18 @@ async def session(ws) -> None:
                 elif kind == "text":
                     await send(ws, {"type": "state", "mode": "thinking"})
                     asyncio.create_task(answer_turn(ws, call, http, b"", str(event.get("text", ""))))
+                elif kind == "client_reply":
+                    turn_id = str(event.get("turn_id") or "")
+                    reply_text = event.get("text")
+                    future = call.pending_replies.get(turn_id)
+                    if future is not None and not future.done() and isinstance(reply_text, str):
+                        future.set_result(reply_text.strip()[:20000])
                 elif kind == "interrupt":
                     call.interrupts += 1
                     call.generation += 1
+                    for future in list(call.pending_replies.values()):
+                        if not future.done():
+                            future.cancel()
                     await send(ws, {"type": "interrupted"})
                 elif kind == "video":
                     on = bool(event.get("on"))
