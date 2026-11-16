@@ -46,6 +46,27 @@ class BrowserReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply["text"], "你好，我在听。")
         self.assertNotIn(turn_id, call.pending_replies)
 
+    async def test_call_ended_during_transcription_does_not_register_reply(self):
+        call = server.Call()
+        call.ws = FakeWebSocket()
+        transcription_started = asyncio.Event()
+        release_transcription = asyncio.Event()
+
+        async def slow_transcribe(_http, _pcm):
+            transcription_started.set()
+            await release_transcription.wait()
+            return "这句话不应进入已结束的通话"
+
+        with patch.object(server, "transcribe", new=slow_transcribe):
+            task = asyncio.create_task(server.answer_turn(None, call, None, b"audio"))
+            await transcription_started.wait()
+            call.ended = True
+            release_transcription.set()
+            await task
+
+        self.assertEqual(call.pending_replies, {})
+        self.assertFalse(any(message.get("type") == "transcript" for message in call.ws.messages))
+
     async def test_interrupted_turn_does_not_send_stale_reply(self):
         call = server.Call()
         call.ws = FakeWebSocket()
