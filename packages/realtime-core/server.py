@@ -400,6 +400,7 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
         try:
             reply = await asyncio.wait_for(reply_future, timeout=120)
         except asyncio.TimeoutError:
+            await send(call.ws, {"type": "reply_timeout", "turn_id": turn_id})
             if not ADAPTER_URL:
                 raise RuntimeError("App reply timed out")
             reply = await request_reply(http, turn)
