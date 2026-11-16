@@ -1,0 +1,106 @@
+# VPS deployment (voice-only first release)
+
+This deployment profile runs the Python WebSocket core as a long-lived service. It deliberately disables video, screen sharing, and vision features. It does not deploy a Char adapter; configure that separately when the App integration is ready.
+
+## Runtime requirements
+
+- Linux server with Python 3.11+ (the Dockerfile uses Python 3.12).
+- Install the voice-only dependencies from `requirements-voice.txt`.
+- The service binds to `127.0.0.1:8780` by default. Put Nginx or another TLS reverse proxy in front of it and expose only HTTPS/WSS publicly.
+- `PORT` is supported as a platform fallback; `PAIVOICE_PORT` takes precedence.
+- `/healthz` returns HTTP 200 for process health checks.
+
+Do not expose the raw Python port directly to the public Internet. Production WebSocket traffic must use TLS (`wss://`).
+
+## Authentication model
+
+Production requires `PAIVOICE_AUTH_SECRET` (at least 32 bytes). The secret is shared only between PaiVoice and a trusted server-side component in your App. Never put it in browser JavaScript, PWA configuration, or a mobile bundle.
+
+Before opening each WebSocket connection, the App backend issues a short-lived ticket and returns it to the authenticated user. The browser passes that ticket in the first `start` message:
+
+```json
+{"type":"start","ticket":"<short-lived-ticket>","video":false,"sample_rate":16000}
+```
+
+Ticket format is `base64url(payload).base64url(HMAC-SHA256(payload))`. Payload fields:
+
+- `sub`: authenticated user identifier.
+- `aud`: exactly `paivoice`.
+- `iat`: issued-at Unix timestamp (seconds).
+- `exp`: expiry Unix timestamp (seconds), no more than 300 seconds after `iat`.
+- `jti`: unique random identifier; each ticket can be used once.
+
+Example Node.js code for the trusted App backend (not browser code):
+
+```js
+import { createHmac, randomUUID } from "node:crypto";
+
+export function issuePaiVoiceTicket(userId) {
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    sub: userId,
+    aud: "paivoice",
+    iat: now,
+    exp: now + 120,
+    jti: randomUUID(),
+  };
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = createHmac("sha256", process.env.PAIVOICE_AUTH_SECRET)
+    .update(encoded)
+    .digest("base64url");
+  return encoded + "." + signature;
+}
+```
+
+The browser-side `VoiceCall` receives a `getAuthTicket` callback. It calls the callback for the initial connection and again for every reconnect, so a fresh one-use ticket is used each time:
+
+```js
+const call = new VoiceCall({
+  url: "wss://pai.example.com/",
+  video: false,
+  getAuthTicket: async () => {
+    const response = await fetch("/api/paivoice/ticket", {
+      method: "POST",
+      credentials: "include",
+    });
+    if (!response.ok) throw new Error("Unable to authorize PaiVoice call");
+    return (await response.json()).ticket;
+  },
+});
+```
+
+The App endpoint shown above is an integration contract/example; it must authenticate the current user, apply call authorization/rate limits, and sign tickets on the server. It is not implemented in this PaiVoice repository.
+
+On reconnect, the ticket subject must match the original call's user. The server rejects reused, expired, incorrectly signed, or incorrectly scoped tickets. Tickets are intentionally short-lived and single-use.
+
+For isolated local development only, set `PAIVOICE_ALLOW_INSECURE_LOCAL=1` with `PAIVOICE_HOST=127.0.0.1` and leave `PAIVOICE_AUTH_SECRET` unset. The server refuses this mode on a non-loopback bind. Never use this setting on a public server.
+
+## Environment and providers
+
+Copy `.env.example` to a server-only environment file. Do not commit real values.
+
+- Start with `PAIVOICE_ASR_PROVIDER=mock` and `PAIVOICE_TTS_PROVIDER=mock` to verify transport and protocol. Mock ASR intentionally returns no transcript and mock TTS produces no audio.
+- Configure Groq ASR and ElevenLabs TTS only after transport tests pass.
+- Keep the Char adapter URL and token server-side.
+- Set `PAIVOICE_ALLOWED_ORIGINS` to the exact browser origins used by the App. Leave no wildcard. Native WebView origins must be confirmed during device integration before tightening this list.
+
+## systemd + Nginx
+
+Example files:
+
+- `deploy/paivoice.service`: run the process as an unprivileged `paivoice` account and restart it on failure.
+- `deploy/nginx-paivoice.conf`: TLS reverse proxy and WebSocket upgrade headers. Replace the sample domain and certificate paths before use.
+
+Create the service account and Python environment, install `requirements-voice.txt`, place the repository at `/opt/paivoice`, create `/etc/paivoice/paivoice.env` with mode 600, then install the systemd unit. Review every path and ownership before enabling it.
+
+## Health and operational checks
+
+- `GET /healthz` should return `200 OK`.
+- WebSocket clients connect with `wss://`, not `ws://`, in production.
+- Monitor service logs for startup failures and provider errors. Do not log ticket values, API keys, raw audio, or transcripts.
+- The in-memory call registry and one-use ticket cache are process-local. Run one service process for this first deployment; horizontal/multi-process scaling requires shared call state and replay protection.
+- Back up configuration separately; never put secrets in Git.
+
+## First-release scope
+
+`PAIVOICE_ENABLE_VIDEO=false` by default. Video, camera frames, screen sharing, companion mode, and vision calls are rejected/ignored until explicitly enabled in a later release. This keeps the first deployment focused on voice transport and reduces unused dependencies.
