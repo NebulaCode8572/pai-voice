@@ -1,6 +1,6 @@
 # VPS deployment (voice-only first release)
 
-This deployment profile runs the Python WebSocket core as a long-lived service. It deliberately disables video, screen sharing, and vision features. It does not deploy a Char adapter; configure that separately when the App integration is ready.
+This deployment profile runs the Python WebSocket core as a long-lived service. It deliberately disables video, screen sharing, and vision features. The App can provide character replies using its existing browser-side chat engine; an optional server-side Adapter remains available as a fallback.
 
 ## Runtime requirements
 
@@ -74,6 +74,20 @@ The App endpoint shown above is an integration contract/example; it must authent
 On reconnect, the ticket subject must match the original call's user. The server rejects reused, expired, incorrectly signed, or incorrectly scoped tickets. Tickets are intentionally short-lived and single-use.
 
 For isolated local development only, set `PAIVOICE_ALLOW_INSECURE_LOCAL=1` with `PAIVOICE_HOST=127.0.0.1` and leave `PAIVOICE_AUTH_SECRET` unset. The server refuses this mode on a non-loopback bind. Never use this setting on a public server.
+
+## Browser-side App reply flow
+
+The App integration can generate character replies in the browser, so the user's existing character settings and provider credentials do not need to be copied to the PaiVoice VPS.
+
+After ASR, the core sends a `transcript` event containing `turn_id` and `text`, then waits up to 120 seconds for a matching message:
+
+```json
+{"type":"client_reply","turn_id":"<turn-id-from-transcript>","text":"<generated-character-reply>"}
+```
+
+The core returns the reply text and synthesized audio over the same WebSocket. If the browser reply times out and `PAIVOICE_ADAPTER_URL` is configured, the core falls back to that server-side Adapter. Interrupting a turn cancels its pending browser reply so an outdated response is not spoken after the user starts a new turn.
+
+The browser must only receive short-lived tickets. The HMAC signing secret remains on the trusted App server and the PaiVoice service.
 
 ## Environment and providers
 
