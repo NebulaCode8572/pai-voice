@@ -76,7 +76,7 @@ PaiVoice 不存在对所有人都正确的一组数值。以下都必须依据�
 
 各 Adapter 的代码可以公开；第三方模型服务、账号权限、模型费用和其各自条款不随本仓库授予。
 
-部署前请先阅读 [密钥与语音隐私](docs/SECRETS.md)：真实 Key 只留在服务器的部署环境中，浏览器和 PWA 永远不持有长期供应商密钥。
+部署前请先阅读 [密钥与语音隐私](docs/SECRETS.md)：真实 Key 只留在服务器的部署环境中，浏览器和 PWA 永远不持有长期供应商密钥。第一版 VPS 语音部署见 [VPS 部署指南](docs/VPS-DEPLOYMENT.md)。
 
 ## 开始方式（计划）
 
@@ -106,7 +106,7 @@ PaiVoice 不存在对所有人都正确的一组数值。以下都必须依据�
 
 降低延迟的做法见 [docs/LATENCY.md](docs/LATENCY.md)（只写思路，不附实现）。
 
-最小本地启动：先安装 `packages/realtime-core/requirements.txt`，配置自己的服务器环境变量，再运行 `python packages/realtime-core/server.py`。默认 `mock` 模式不调用任何云服务；接入 Groq、ElevenLabs 或 OpenAI 前，请阅读 [密钥与语音隐私](docs/SECRETS.md)。
+本地开发可安装 `packages/realtime-core/requirements-voice.txt`，并显式设置 `PAIVOICE_ALLOW_INSECURE_LOCAL=1`（仅允许绑定 loopback 地址）后运行核心服务。生产部署必须配置 `PAIVOICE_AUTH_SECRET`，由可信 App 后端签发短时效一次性通话票据；详见 [VPS 部署指南](docs/VPS-DEPLOYMENT.md)。默认 `mock` 模式不调用云服务；接入 Groq、ElevenLabs 或其他服务前，请阅读 [密钥与语音隐私](docs/SECRETS.md)。
 
 终端整合提供完整可运行代码与最小接入说明：[Claude CLI / tmux](docs/CLAUDE-TMUX.md) · [Codex CLI / tmux](docs/CODEX-TMUX.md)。
 
