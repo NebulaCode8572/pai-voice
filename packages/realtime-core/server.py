@@ -39,6 +39,10 @@ USED_TICKETS: dict[str, int] = {}
 
 if AUTH_SECRET and len(AUTH_SECRET.encode("utf-8")) < 32:
     raise RuntimeError("PAIVOICE_AUTH_SECRET must contain at least 32 bytes")
+if AUTH_SECRET and not ALLOWED_ORIGINS:
+    raise RuntimeError("PAIVOICE_ALLOWED_ORIGINS must contain the exact App origin(s)")
+if "*" in ALLOWED_ORIGINS:
+    raise RuntimeError("PAIVOICE_ALLOWED_ORIGINS does not allow wildcard origins")
 if not AUTH_SECRET:
     if not ALLOW_INSECURE_LOCAL:
         raise RuntimeError("PAIVOICE_AUTH_SECRET is required; see docs/VPS-DEPLOYMENT.md")
