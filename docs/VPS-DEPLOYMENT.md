@@ -75,6 +75,8 @@ On reconnect, the ticket subject must match the original call's user. The server
 
 For isolated local development only, set `PAIVOICE_ALLOW_INSECURE_LOCAL=1` with `PAIVOICE_HOST=127.0.0.1` and leave `PAIVOICE_AUTH_SECRET` unset. The server refuses this mode on a non-loopback bind. Never use this setting on a public server.
 
+The service enforces one active call per authenticated account. A reconnect that presents the existing call ID resumes that call; opening a second fresh call for the same account is rejected.
+
 ## Browser-side App reply flow
 
 The App integration can generate character replies in the browser, so the user's existing character settings and provider credentials do not need to be copied to the PaiVoice VPS.
