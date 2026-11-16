@@ -14,7 +14,7 @@ Do not expose the raw Python port directly to the public Internet. Production We
 
 ## Authentication model
 
-Production requires `PAIVOICE_AUTH_SECRET` (at least 32 bytes). The secret is shared only between PaiVoice and a trusted server-side component in your App. Never put it in browser JavaScript, PWA configuration, or a mobile bundle.
+Production requires `PAIVOICE_AUTH_SECRET` (at least 32 bytes). Generate a value with `openssl rand -hex 32`; never use the example placeholder or commit the generated value. The secret is shared only between PaiVoice and a trusted server-side component in your App. Never put it in browser JavaScript, PWA configuration, or a mobile bundle.
 
 Before opening each WebSocket connection, the App backend issues a short-lived ticket and returns it to the authenticated user. The browser passes that ticket in the first `start` message:
 
@@ -100,6 +100,10 @@ Create the service account and Python environment, install `requirements-voice.t
 - Monitor service logs for startup failures and provider errors. Do not log ticket values, API keys, raw audio, or transcripts.
 - The in-memory call registry and one-use ticket cache are process-local. Run one service process for this first deployment; horizontal/multi-process scaling requires shared call state and replay protection.
 - Back up configuration separately; never put secrets in Git.
+
+## License notice
+
+This repository is licensed under AGPL-3.0. If you modify PaiVoice and let users interact with that modified version remotely over a network, AGPL-3.0 section 13 requires a prominent, no-charge way for those users to obtain the corresponding source code. Keep the license and copyright notices, and add a source-code link/offer in the user-facing App before public rollout. This is a compliance note, not legal advice.
 
 ## First-release scope
 
