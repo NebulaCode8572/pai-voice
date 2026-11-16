@@ -30,7 +30,7 @@ from websockets.exceptions import ConnectionClosed
 
 SAMPLE_RATE = 16_000
 HOST = os.getenv("PAIVOICE_HOST", "127.0.0.1")
-PORT = int(os.getenv("PAIVOICE_PORT") or os.getenv("PORT", "8780"))
+PORT = int(os.getenv("PAIVOICE_PORT") or os.getenv("PORT") or "8780")
 AUTH_SECRET = os.getenv("PAIVOICE_AUTH_SECRET", "")
 ALLOW_INSECURE_LOCAL = os.getenv("PAIVOICE_ALLOW_INSECURE_LOCAL", "").lower() in ("1", "true", "yes")
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv("PAIVOICE_ALLOWED_ORIGINS", "").split(",") if x.strip()]
