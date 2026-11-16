@@ -217,6 +217,13 @@ export class VoiceCall {
     return true;
   }
 
+  /** Ask the App to generate the character's first utterance after an incoming call is accepted. */
+  startProactiveTurn() {
+    if (this._hungUp || !this.ws || this.ws.readyState !== 1) return false;
+    this._send({ type: 'proactive' });
+    return true;
+  }
+
   _flushPendingReplies() {
     while (this._pendingReplies.length && this.ws && this.ws.readyState === 1) {
       this._send(this._pendingReplies.shift());
@@ -479,6 +486,7 @@ export class VoiceCall {
         if (msg.mode) this._setMode(msg.mode === 'speaking' && !this.playing ? 'thinking' : msg.mode);
         break;
       case 'transcript': this.stats.turns += 1; this.emit('transcript', msg); break;
+      case 'proactive_turn': this.emit('proactiveTurn', msg); break;
       case 'prosody': this.emit('prosody', msg); break;
       case 'reply_text':
         if (msg.generation_id !== this.generationId) { this.generationId = msg.generation_id; }
