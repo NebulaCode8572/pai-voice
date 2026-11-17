@@ -96,7 +96,11 @@ The browser must only receive short-lived tickets. The HMAC signing secret remai
 Copy `.env.example` to a server-only environment file. Do not commit real values.
 
 - Start with `PAIVOICE_ASR_PROVIDER=mock` and `PAIVOICE_TTS_PROVIDER=mock` to verify transport and protocol. Mock ASR intentionally returns no transcript and mock TTS produces no audio.
-- Configure Groq ASR and ElevenLabs TTS only after transport tests pass.
+- MiniMax TTS is supported with `PAIVOICE_TTS_PROVIDER=minimax`. Set `PAIVOICE_TTS_API_KEY` and `PAIVOICE_MINIMAX_VOICE_ID` in the server-only environment. The key may also be supplied as `MINIMAX_API_KEY`.
+- To preserve Float's voice identity, copy the character's exact MiniMax model, Voice ID, speech speed, pitch, and optional language boost into the corresponding `PAIVOICE_MINIMAX_*` variables. Defaults mirror Float's T2A V2 defaults: `speech-01-turbo`, speed 1.0, pitch 0, volume 1.0, mono 44.1kHz and 256kbps MP3 for non-streaming.
+- `PAIVOICE_MINIMAX_STREAM=true` enables low-latency SSE synthesis and sends 44.1kHz signed 16-bit PCM chunks to the App as they arrive. This changes the transport encoding from Float's MP3 output but keeps the same model and voice settings; compare the actual sound on-device. Set it to `false` for the exact 44.1kHz/256kbps MP3 output format used by Float, with playback beginning after synthesis completes.
+- MiniMax is currently the TTS provider only; ASR remains independently selectable (for example, Groq). The browser still generates Char's reply using Float's existing chat engine.
+- ElevenLabs remains available as an alternative TTS provider.
 - Keep the Char adapter URL and token server-side.
 - Set `PAIVOICE_ALLOWED_ORIGINS` to the exact browser origins used by the App. Leave no wildcard. Native WebView origins must be confirmed during device integration before tightening this list.
 
