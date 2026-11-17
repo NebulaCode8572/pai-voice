@@ -168,5 +168,78 @@ class BrowserReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(turn_id, call.pending_replies)
 
 
+class MiniMaxTtsConfigTests(unittest.TestCase):
+    def test_call_voice_settings_are_sanitized_and_secret_fields_ignored(self):
+        config = server.normalize_call_tts_config({
+            "model": "speech-2.8-hd",
+            "voice_id": "char_voice_01",
+            "speed": 1.25,
+            "pitch": 2.6,
+            "language_boost": "Chinese",
+            "api_key": "must-not-be-accepted",
+            "base_url": "https://attacker.example",
+        })
+        self.assertEqual(config, {
+            "model": "speech-2.8-hd",
+            "voice_id": "char_voice_01",
+            "speed": 1.25,
+            "pitch": 3,
+            "language_boost": "Chinese",
+        })
+        self.assertNotIn("api_key", config)
+        self.assertNotIn("base_url", config)
+
+    def test_voice_settings_match_float_defaults_and_selected_character(self):
+        config = server.normalize_call_tts_config({
+            "model": "speech-2.8-hd",
+            "voice_id": "char_voice_01",
+            "speed": 1.4,
+            "pitch": -2,
+            "language_boost": "Chinese",
+        })
+        with (
+            patch.object(server, "MINIMAX_MODEL", "speech-01-turbo"),
+            patch.object(server, "MINIMAX_VOICE", "fallback_voice"),
+            patch.object(server, "MINIMAX_SPEED", 1.0),
+            patch.object(server, "MINIMAX_PITCH", 0),
+            patch.object(server, "MINIMAX_LANGUAGE_BOOST", ""),
+            patch.object(server, "MINIMAX_EMOTION", ""),
+        ):
+            body = server.minimax_request_body("[语音条: 你好。]", stream=False, tts_config=config)
+
+        self.assertEqual(body["model"], "speech-2.8-hd")
+        self.assertEqual(body["text"], "你好。")
+        self.assertEqual(body["voice_setting"], {
+            "voice_id": "char_voice_01",
+            "speed": 1.4,
+            "vol": 1.0,
+            "pitch": -2,
+        })
+        self.assertEqual(body["audio_setting"], {
+            "sample_rate": 44_100,
+            "format": "mp3",
+            "channel": 1,
+            "bitrate": 256_000,
+        })
+        self.assertEqual(body["language_boost"], "Chinese")
+
+    def test_streaming_uses_pcm_chunks_and_non_streaming_keeps_float_mp3_format(self):
+        with (
+            patch.object(server, "MINIMAX_VOICE", "fallback_voice"),
+            patch.object(server, "MINIMAX_MODEL", "speech-01-turbo"),
+            patch.object(server, "MINIMAX_EMOTION", ""),
+            patch.object(server, "MINIMAX_LANGUAGE_BOOST", ""),
+        ):
+            streaming = server.minimax_request_body("你好", stream=True)
+            buffered = server.minimax_request_body("你好", stream=False)
+
+        self.assertEqual(streaming["audio_setting"]["format"], "pcm")
+        self.assertEqual(streaming["audio_setting"]["sample_rate"], 44_100)
+        self.assertEqual(streaming["stream_options"], {"exclude_aggregated_audio": True})
+        self.assertNotIn("bitrate", streaming["audio_setting"])
+        self.assertEqual(buffered["audio_setting"]["format"], "mp3")
+        self.assertEqual(buffered["audio_setting"]["bitrate"], 256_000)
+
+
 if __name__ == "__main__":
     unittest.main()
