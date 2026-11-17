@@ -14,6 +14,7 @@ import base64
 import io
 import ipaddress
 import json
+import math
 import os
 import time
 import uuid
@@ -142,8 +143,9 @@ def normalize_call_tts_config(value: object) -> dict:
     except (TypeError, ValueError):
         pass
     try:
-        pitch = int(value.get("pitch", MINIMAX_PITCH))
-        result["pitch"] = min(12, max(-12, pitch))
+        pitch = float(value.get("pitch", MINIMAX_PITCH))
+        if pitch == pitch and abs(pitch) != float("inf"):
+            result["pitch"] = min(12, max(-12, math.floor(pitch + 0.5)))
     except (TypeError, ValueError):
         pass
     language = value.get("language_boost")
