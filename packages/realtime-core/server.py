@@ -191,7 +191,7 @@ async def minimax_synthesize(http: aiohttp.ClientSession, text: str) -> bytes:
 
 async def minimax_stream(http: aiohttp.ClientSession, text: str):
     """Yield signed 16-bit PCM chunks from MiniMax SSE as soon as they arrive."""
-    if not TTS_KEY:
+    if not MINIMAX_KEY:
         raise RuntimeError("MiniMax TTS API Key 未配置")
     if not MINIMAX_VOICE:
         raise RuntimeError("MiniMax TTS Voice ID 未配置")
