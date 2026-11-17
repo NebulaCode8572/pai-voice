@@ -124,6 +124,34 @@ async def request_reply(http: aiohttp.ClientSession, turn: dict) -> str:
     return str(result.get("reply", "")).strip()
 
 
+def normalize_call_tts_config(value: object) -> dict:
+    """Accept only non-secret MiniMax synthesis settings from the App client."""
+    if not isinstance(value, dict):
+        return {}
+    result: dict = {}
+    model = value.get("model")
+    if isinstance(model, str) and 0 < len(model) <= 64 and all(c.isalnum() or c in "-_." for c in model):
+        result["model"] = model
+    voice_id = value.get("voice_id")
+    if isinstance(voice_id, str) and 0 < len(voice_id) <= 128 and all(c.isalnum() or c in "-_." for c in voice_id):
+        result["voice_id"] = voice_id
+    try:
+        speed = float(value.get("speed", MINIMAX_SPEED))
+        if speed == speed and abs(speed) != float("inf"):
+            result["speed"] = min(2.0, max(0.5, speed))
+    except (TypeError, ValueError):
+        pass
+    try:
+        pitch = int(value.get("pitch", MINIMAX_PITCH))
+        result["pitch"] = min(12, max(-12, pitch))
+    except (TypeError, ValueError):
+        pass
+    language = value.get("language_boost")
+    if isinstance(language, str) and len(language) <= 32 and all(c.isalnum() or c in "-_ " for c in language):
+        result["language_boost"] = language.strip()
+    return result
+
+
 def clean_minimax_text(text: str) -> str:
     """Match Float's MiniMax text wrapper cleanup exactly."""
     clean = text.strip()
@@ -136,19 +164,29 @@ def clean_minimax_text(text: str) -> str:
     return clean.strip()
 
 
-def minimax_voice_setting() -> dict:
-    voice = {"voice_id": MINIMAX_VOICE, "speed": MINIMAX_SPEED, "vol": 1.0, "pitch": MINIMAX_PITCH}
+def minimax_voice_setting(tts_config: dict | None = None) -> dict:
+    config = tts_config or {}
+    voice_id = config.get("voice_id") or MINIMAX_VOICE
+    if not voice_id:
+        raise RuntimeError("MiniMax TTS Voice ID 未配置")
+    voice = {
+        "voice_id": voice_id,
+        "speed": config.get("speed", MINIMAX_SPEED),
+        "vol": 1.0,
+        "pitch": config.get("pitch", MINIMAX_PITCH),
+    }
     if MINIMAX_EMOTION in MINIMAX_EMOTIONS:
         voice["emotion"] = MINIMAX_EMOTION
     return voice
 
 
-def minimax_request_body(text: str, *, stream: bool) -> dict:
+def minimax_request_body(text: str, *, stream: bool, tts_config: dict | None = None) -> dict:
+    config = tts_config or {}
     body = {
-        "model": MINIMAX_MODEL,
+        "model": config.get("model") or MINIMAX_MODEL,
         "text": clean_minimax_text(text),
         "stream": stream,
-        "voice_setting": minimax_voice_setting(),
+        "voice_setting": minimax_voice_setting(config),
         "audio_setting": {
             "sample_rate": 44_100,
             "bitrate": 256_000,
@@ -156,22 +194,22 @@ def minimax_request_body(text: str, *, stream: bool) -> dict:
             "channel": 1,
         },
     }
-    if MINIMAX_LANGUAGE_BOOST:
-        body["language_boost"] = MINIMAX_LANGUAGE_BOOST
+    language_boost = config.get("language_boost") or MINIMAX_LANGUAGE_BOOST
+    if language_boost:
+        body["language_boost"] = language_boost
     if stream:
         # Avoid a second, aggregated copy of the complete audio at stream end.
         body["stream_options"] = {"exclude_aggregated_audio": True}
     return body
 
 
-async def minimax_synthesize(http: aiohttp.ClientSession, text: str) -> bytes:
+async def minimax_synthesize(http: aiohttp.ClientSession, text: str, tts_config: dict | None = None) -> bytes:
     if not MINIMAX_KEY:
         raise RuntimeError("MiniMax TTS API Key 未配置")
-    if not MINIMAX_VOICE:
-        raise RuntimeError("MiniMax TTS Voice ID 未配置")
+    minimax_voice_setting(tts_config)
     headers = {"Authorization": f"Bearer {MINIMAX_KEY}", "Content-Type": "application/json"}
     async with http.post(f"{MINIMAX_BASE_URL}/t2a_v2", headers=headers,
-                         json=minimax_request_body(text, stream=False),
+                         json=minimax_request_body(text, stream=False, tts_config=tts_config),
                          timeout=aiohttp.ClientTimeout(total=120)) as response:
         if response.status != 200:
             detail = await response.text()
@@ -189,15 +227,14 @@ async def minimax_synthesize(http: aiohttp.ClientSession, text: str) -> bytes:
         raise RuntimeError("MiniMax 返回了无效的音频数据") from error
 
 
-async def minimax_stream(http: aiohttp.ClientSession, text: str):
+async def minimax_stream(http: aiohttp.ClientSession, text: str, tts_config: dict | None = None):
     """Yield signed 16-bit PCM chunks from MiniMax SSE as soon as they arrive."""
     if not MINIMAX_KEY:
         raise RuntimeError("MiniMax TTS API Key 未配置")
-    if not MINIMAX_VOICE:
-        raise RuntimeError("MiniMax TTS Voice ID 未配置")
+    minimax_voice_setting(tts_config)
     headers = {"Authorization": f"Bearer {MINIMAX_KEY}", "Content-Type": "application/json",
                "Accept": "text/event-stream"}
-    body = minimax_request_body(text, stream=True)
+    body = minimax_request_body(text, stream=True, tts_config=tts_config)
     saw_audio = False
     pending = b""
 
@@ -250,28 +287,28 @@ async def minimax_stream(http: aiohttp.ClientSession, text: str):
         raise RuntimeError("MiniMax 流式合成未返回音频片段")
 
 
-async def synthesized_audio_chunks(http: aiohttp.ClientSession, text: str):
+async def synthesized_audio_chunks(http: aiohttp.ClientSession, text: str, tts_config: dict | None = None):
     """Yield (audio bytes, wire format, sample rate); PCM can play before TTS finishes."""
     if TTS_PROVIDER == "mock" or not text:
         return
     if TTS_PROVIDER == "minimax":
         if MINIMAX_STREAM:
-            async for chunk in minimax_stream(http, text):
+            async for chunk in minimax_stream(http, text, tts_config):
                 yield chunk, "pcm_s16le", 44_100
         else:
-            yield await minimax_synthesize(http, text), "mp3", None
+            yield await minimax_synthesize(http, text, tts_config), "mp3", None
         return
-    audio = await synthesize(http, text)
+    audio = await synthesize(http, text, tts_config)
     if audio:
         yield audio, "mp3", None
 
 
-async def synthesize(http: aiohttp.ClientSession, text: str) -> bytes | None:
+async def synthesize(http: aiohttp.ClientSession, text: str, tts_config: dict | None = None) -> bytes | None:
     """Non-streaming fallback for providers that return a complete audio file."""
     if TTS_PROVIDER == "mock" or not text:
         return None
     if TTS_PROVIDER == "minimax":
-        return await minimax_synthesize(http, text)
+        return await minimax_synthesize(http, text, tts_config)
     if TTS_PROVIDER != "elevenlabs" or not TTS_KEY or not ELEVEN_VOICE:
         raise RuntimeError("TTS provider is not configured")
     headers = {"xi-api-key": TTS_KEY, "accept": "audio/mpeg", "content-type": "application/json"}
@@ -353,6 +390,7 @@ class Call:
     end_task: object = None                   # 等接回的倒计时
     ended: bool = False
     user_id: str = ""
+    tts_config: dict = field(default_factory=dict)   # safe per-call MiniMax settings; never contains provider credentials
     watch_title: str = ""                     # 一起看电影：前端告诉的片名；空 = 普通屏幕共享
     interrupts: int = 0                       # 对方开口打断的次数：只停正在念的那句，排着的照念
     pending_replies: dict[str, asyncio.Future] = field(default_factory=dict)  # 等待浏览器端 LLM 返回的回合
@@ -570,7 +608,7 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
             call.generation += 1
             generation = call.generation
             await send(call.ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": reply})
-            audio_chunks = synthesized_audio_chunks(http, reply)
+            audio_chunks = synthesized_audio_chunks(http, reply, call.tts_config)
             try:
                 async for audio, audio_format, sample_rate in audio_chunks:
                     if call.interrupts != heard or call.ended:
@@ -722,6 +760,7 @@ async def session(ws) -> None:
                             old.end_task = None
                         old.active, old.audio = False, bytearray()
                         call = old
+                        call.tts_config = normalize_call_tts_config(event.get("tts_config"))
                         if prev is not None and prev is not ws:
                             try:
                                 await prev.close(code=4000, reason="replaced by a new connection")
@@ -737,6 +776,7 @@ async def session(ws) -> None:
                             return
                         call.ws = ws
                         call.user_id = user_id
+                        call.tts_config = normalize_call_tts_config(event.get("tts_config"))
                         CALLS[call.id] = call
                         await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening"})
                         await notify_adapter(http, {"type": "call_start", "call_session_id": call.id})   # 来电接通：先告诉回复端
