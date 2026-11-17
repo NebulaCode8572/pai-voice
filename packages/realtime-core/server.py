@@ -191,9 +191,9 @@ def minimax_request_body(text: str, *, stream: bool, tts_config: dict | None = N
         "voice_setting": minimax_voice_setting(config),
         "audio_setting": {
             "sample_rate": 44_100,
-            "bitrate": 256_000,
             "format": "pcm" if stream else "mp3",
             "channel": 1,
+            **({} if stream else {"bitrate": 256_000}),
         },
     }
     language_boost = config.get("language_boost") or MINIMAX_LANGUAGE_BOOST
