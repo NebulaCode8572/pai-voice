@@ -125,7 +125,14 @@ async def request_reply(http: aiohttp.ClientSession, turn: dict) -> str:
 
 def clean_minimax_text(text: str) -> str:
     """Match Float's MiniMax text wrapper cleanup exactly."""
-    return text.replace("[语音条:", "[语音条:").strip().removeprefix("[语音条:").strip().removesuffix("]").strip() if text.startswith("[语音条:") else text.strip()
+    clean = text.strip()
+    for prefix in ("[语音条:", "[语音条："):
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+            break
+    if clean.endswith("]"):
+        clean = clean[:-1]
+    return clean.strip()
 
 
 def minimax_voice_setting() -> dict:
