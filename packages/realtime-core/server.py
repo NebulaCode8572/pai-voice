@@ -56,9 +56,19 @@ if not AUTH_SECRET:
 ASR_PROVIDER = os.getenv("PAIVOICE_ASR_PROVIDER", "mock")
 TTS_PROVIDER = os.getenv("PAIVOICE_TTS_PROVIDER", "mock")
 ASR_KEY = os.getenv("PAIVOICE_ASR_API_KEY") or os.getenv("GROQ_API_KEY", "")
-TTS_KEY = os.getenv("PAIVOICE_TTS_API_KEY") or os.getenv("ELEVENLABS_API_KEY", "")
+TTS_KEY = (os.getenv("PAIVOICE_TTS_API_KEY") or os.getenv("MINIMAX_API_KEY", "")
+           or os.getenv("ELEVENLABS_API_KEY", ""))
 GROQ_MODEL = os.getenv("PAIVOICE_GROQ_ASR_MODEL", "whisper-large-v3-turbo")
 ELEVEN_VOICE = os.getenv("PAIVOICE_ELEVEN_VOICE_ID", "")
+MINIMAX_BASE_URL = os.getenv("PAIVOICE_MINIMAX_BASE_URL", "https://api.minimaxi.com/v1").rstrip("/")
+MINIMAX_MODEL = os.getenv("PAIVOICE_MINIMAX_MODEL", "speech-01-turbo")
+MINIMAX_VOICE = os.getenv("PAIVOICE_MINIMAX_VOICE_ID", "")
+MINIMAX_SPEED = min(2.0, max(0.5, float(os.getenv("PAIVOICE_MINIMAX_SPEED", "1.0"))))
+MINIMAX_PITCH = min(12, max(-12, int(os.getenv("PAIVOICE_MINIMAX_PITCH", "0"))))
+MINIMAX_EMOTION = os.getenv("PAIVOICE_MINIMAX_EMOTION", "").strip().lower()
+MINIMAX_LANGUAGE_BOOST = os.getenv("PAIVOICE_MINIMAX_LANGUAGE_BOOST", "").strip()
+MINIMAX_STREAM = os.getenv("PAIVOICE_MINIMAX_STREAM", "true").lower() in ("1", "true", "yes")
+MINIMAX_EMOTIONS = {"happy", "sad", "angry", "fearful", "disgusted", "surprised", "calm", "neutral", "fluent"}
 ADAPTER_URL = os.getenv("PAIVOICE_ADAPTER_URL", "")
 ADAPTER_TOKEN = os.getenv("PAIVOICE_ADAPTER_TOKEN", "")
 MAX_TURN_SECONDS = int(os.getenv("PAIVOICE_MAX_TURN_SECONDS", "60"))
@@ -113,10 +123,147 @@ async def request_reply(http: aiohttp.ClientSession, turn: dict) -> str:
     return str(result.get("reply", "")).strip()
 
 
+def clean_minimax_text(text: str) -> str:
+    """Match Float's MiniMax text wrapper cleanup exactly."""
+    return text.replace("[语音条:", "[语音条:").strip().removeprefix("[语音条:").strip().removesuffix("]").strip() if text.startswith("[语音条:") else text.strip()
+
+
+def minimax_voice_setting() -> dict:
+    voice = {"voice_id": MINIMAX_VOICE, "speed": MINIMAX_SPEED, "vol": 1.0, "pitch": MINIMAX_PITCH}
+    if MINIMAX_EMOTION in MINIMAX_EMOTIONS:
+        voice["emotion"] = MINIMAX_EMOTION
+    return voice
+
+
+def minimax_request_body(text: str, *, stream: bool) -> dict:
+    body = {
+        "model": MINIMAX_MODEL,
+        "text": clean_minimax_text(text),
+        "stream": stream,
+        "voice_setting": minimax_voice_setting(),
+        "audio_setting": {
+            "sample_rate": 44_100,
+            "bitrate": 256_000,
+            "format": "pcm" if stream else "mp3",
+            "channel": 1,
+        },
+    }
+    if MINIMAX_LANGUAGE_BOOST:
+        body["language_boost"] = MINIMAX_LANGUAGE_BOOST
+    if stream:
+        # Avoid a second, aggregated copy of the complete audio at stream end.
+        body["stream_options"] = {"exclude_aggregated_audio": True}
+    return body
+
+
+async def minimax_synthesize(http: aiohttp.ClientSession, text: str) -> bytes:
+    if not TTS_KEY:
+        raise RuntimeError("MiniMax TTS API Key 未配置")
+    if not MINIMAX_VOICE:
+        raise RuntimeError("MiniMax TTS Voice ID 未配置")
+    headers = {"Authorization": f"Bearer {TTS_KEY}", "Content-Type": "application/json"}
+    async with http.post(f"{MINIMAX_BASE_URL}/t2a_v2", headers=headers,
+                         json=minimax_request_body(text, stream=False),
+                         timeout=aiohttp.ClientTimeout(total=120)) as response:
+        if response.status != 200:
+            detail = await response.text()
+            raise RuntimeError(f"MiniMax TTS 请求失败 ({response.status}): {detail[:300]}")
+        result = await response.json()
+    status = (result.get("base_resp") or {}).get("status_code", 0)
+    if status not in (0, None):
+        raise RuntimeError((result.get("base_resp") or {}).get("status_msg") or "MiniMax TTS 合成失败")
+    audio_hex = (result.get("data") or {}).get("audio", "")
+    if not audio_hex:
+        raise RuntimeError((result.get("base_resp") or {}).get("status_msg") or "MiniMax 未返回音频")
+    try:
+        return bytes.fromhex(audio_hex)
+    except ValueError as error:
+        raise RuntimeError("MiniMax 返回了无效的音频数据") from error
+
+
+async def minimax_stream(http: aiohttp.ClientSession, text: str):
+    """Yield signed 16-bit PCM chunks from MiniMax SSE as soon as they arrive."""
+    if not TTS_KEY:
+        raise RuntimeError("MiniMax TTS API Key 未配置")
+    if not MINIMAX_VOICE:
+        raise RuntimeError("MiniMax TTS Voice ID 未配置")
+    headers = {"Authorization": f"Bearer {TTS_KEY}", "Content-Type": "application/json",
+               "Accept": "text/event-stream"}
+    body = minimax_request_body(text, stream=True)
+    saw_audio = False
+    pending = b""
+
+    async with http.post(f"{MINIMAX_BASE_URL}/t2a_v2", headers=headers, json=body,
+                         timeout=aiohttp.ClientTimeout(total=120)) as response:
+        if response.status != 200:
+            detail = await response.text()
+            raise RuntimeError(f"MiniMax TTS 流式请求失败 ({response.status}): {detail[:300]}")
+        async for network_chunk in response.content.iter_any():
+            pending += network_chunk
+            while b"\n" in pending:
+                raw_line, pending = pending.split(b"\n", 1)
+                line = raw_line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == b"[DONE]":
+                    continue
+                try:
+                    event = json.loads(payload.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                base = event.get("base_resp") or {}
+                if base.get("status_code", 0) not in (0, None):
+                    raise RuntimeError(base.get("status_msg") or "MiniMax TTS 流式合成失败")
+                data = event.get("data") or {}
+                audio_hex = data.get("audio") or ""
+                if audio_hex:
+                    try:
+                        chunk = bytes.fromhex(audio_hex)
+                    except ValueError as error:
+                        raise RuntimeError("MiniMax 返回了无效的 PCM 音频片段") from error
+                    if chunk:
+                        saw_audio = True
+                        yield chunk
+        if pending.strip().startswith(b"data:"):
+            payload = pending.strip()[5:].strip()
+            if payload and payload != b"[DONE]":
+                event = json.loads(payload.decode("utf-8"))
+                base = event.get("base_resp") or {}
+                if base.get("status_code", 0) not in (0, None):
+                    raise RuntimeError(base.get("status_msg") or "MiniMax TTS 流式合成失败")
+                audio_hex = (event.get("data") or {}).get("audio") or ""
+                if audio_hex:
+                    chunk = bytes.fromhex(audio_hex)
+                    if chunk:
+                        saw_audio = True
+                        yield chunk
+    if not saw_audio:
+        raise RuntimeError("MiniMax 流式合成未返回音频片段")
+
+
+async def synthesized_audio_chunks(http: aiohttp.ClientSession, text: str):
+    """Yield (audio bytes, wire format, sample rate); PCM can play before TTS finishes."""
+    if TTS_PROVIDER == "mock" or not text:
+        return
+    if TTS_PROVIDER == "minimax":
+        if MINIMAX_STREAM:
+            async for chunk in minimax_stream(http, text):
+                yield chunk, "pcm_s16le", 44_100
+        else:
+            yield await minimax_synthesize(http, text), "mp3", None
+        return
+    audio = await synthesize(http, text)
+    if audio:
+        yield audio, "mp3", None
+
+
 async def synthesize(http: aiohttp.ClientSession, text: str) -> bytes | None:
-    """ElevenLabs is optional. Without a TTS provider, the client still gets text."""
+    """Non-streaming fallback for providers that return a complete audio file."""
     if TTS_PROVIDER == "mock" or not text:
         return None
+    if TTS_PROVIDER == "minimax":
+        return await minimax_synthesize(http, text)
     if TTS_PROVIDER != "elevenlabs" or not TTS_KEY or not ELEVEN_VOICE:
         raise RuntimeError("TTS provider is not configured")
     headers = {"xi-api-key": TTS_KEY, "accept": "audio/mpeg", "content-type": "application/json"}
@@ -415,9 +562,15 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
             call.generation += 1
             generation = call.generation
             await send(call.ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": reply})
-            audio = await synthesize(http, reply)
-            if audio and call.interrupts == heard:
-                await send(call.ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
+            async for audio, audio_format, sample_rate in synthesized_audio_chunks(http, reply):
+                if call.interrupts != heard or call.ended:
+                    break
+                message = {"type": "audio", "generation_id": generation,
+                           "format": audio_format, "data": base64.b64encode(audio).decode("ascii")}
+                if sample_rate:
+                    message["sample_rate"] = sample_rate
+                await send(call.ws, message)
+            if call.interrupts == heard:
                 await send(call.ws, {"type": "audio_sentence_end", "generation_id": generation})
             await send(call.ws, {"type": "generation_end", "generation_id": generation})
     except asyncio.CancelledError:
@@ -468,13 +621,19 @@ async def proactive_turn(ws, call: Call, http: aiohttp.ClientSession) -> None:
                 "turn_id": turn_id,
                 "text": reply,
             })
-            audio = await synthesize(http, reply)
-            if audio and call.interrupts == heard:
-                await send(call.ws, {
+            async for audio, audio_format, sample_rate in synthesized_audio_chunks(http, reply):
+                if call.interrupts != heard or call.ended:
+                    break
+                message = {
                     "type": "audio",
                     "generation_id": generation,
+                    "format": audio_format,
                     "data": base64.b64encode(audio).decode("ascii"),
-                })
+                }
+                if sample_rate:
+                    message["sample_rate"] = sample_rate
+                await send(call.ws, message)
+            if call.interrupts == heard:
                 await send(call.ws, {"type": "audio_sentence_end", "generation_id": generation})
             await send(call.ws, {"type": "generation_end", "generation_id": generation})
     except asyncio.CancelledError:
