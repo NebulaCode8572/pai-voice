@@ -671,7 +671,7 @@ async def proactive_turn(ws, call: Call, http: aiohttp.ClientSession) -> None:
                 "turn_id": turn_id,
                 "text": reply,
             })
-            audio_chunks = synthesized_audio_chunks(http, reply)
+            audio_chunks = synthesized_audio_chunks(http, reply, call.tts_config)
             try:
                 async for audio, audio_format, sample_rate in audio_chunks:
                     if call.interrupts != heard or call.ended:
