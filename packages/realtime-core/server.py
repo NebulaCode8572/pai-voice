@@ -56,8 +56,9 @@ if not AUTH_SECRET:
 ASR_PROVIDER = os.getenv("PAIVOICE_ASR_PROVIDER", "mock")
 TTS_PROVIDER = os.getenv("PAIVOICE_TTS_PROVIDER", "mock")
 ASR_KEY = os.getenv("PAIVOICE_ASR_API_KEY") or os.getenv("GROQ_API_KEY", "")
-TTS_KEY = (os.getenv("PAIVOICE_TTS_API_KEY") or os.getenv("MINIMAX_API_KEY", "")
-           or os.getenv("ELEVENLABS_API_KEY", ""))
+TTS_KEY = os.getenv("PAIVOICE_TTS_API_KEY") or os.getenv("ELEVENLABS_API_KEY", "")
+MINIMAX_KEY = (os.getenv("PAIVOICE_MINIMAX_API_KEY") or os.getenv("PAIVOICE_TTS_API_KEY")
+               or os.getenv("MINIMAX_API_KEY", ""))
 GROQ_MODEL = os.getenv("PAIVOICE_GROQ_ASR_MODEL", "whisper-large-v3-turbo")
 ELEVEN_VOICE = os.getenv("PAIVOICE_ELEVEN_VOICE_ID", "")
 MINIMAX_BASE_URL = os.getenv("PAIVOICE_MINIMAX_BASE_URL", "https://api.minimaxi.com/v1").rstrip("/")
@@ -164,11 +165,11 @@ def minimax_request_body(text: str, *, stream: bool) -> dict:
 
 
 async def minimax_synthesize(http: aiohttp.ClientSession, text: str) -> bytes:
-    if not TTS_KEY:
+    if not MINIMAX_KEY:
         raise RuntimeError("MiniMax TTS API Key 未配置")
     if not MINIMAX_VOICE:
         raise RuntimeError("MiniMax TTS Voice ID 未配置")
-    headers = {"Authorization": f"Bearer {TTS_KEY}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {MINIMAX_KEY}", "Content-Type": "application/json"}
     async with http.post(f"{MINIMAX_BASE_URL}/t2a_v2", headers=headers,
                          json=minimax_request_body(text, stream=False),
                          timeout=aiohttp.ClientTimeout(total=120)) as response:
@@ -194,7 +195,7 @@ async def minimax_stream(http: aiohttp.ClientSession, text: str):
         raise RuntimeError("MiniMax TTS API Key 未配置")
     if not MINIMAX_VOICE:
         raise RuntimeError("MiniMax TTS Voice ID 未配置")
-    headers = {"Authorization": f"Bearer {TTS_KEY}", "Content-Type": "application/json",
+    headers = {"Authorization": f"Bearer {MINIMAX_KEY}", "Content-Type": "application/json",
                "Accept": "text/event-stream"}
     body = minimax_request_body(text, stream=True)
     saw_audio = False
@@ -569,14 +570,18 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
             call.generation += 1
             generation = call.generation
             await send(call.ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": reply})
-            async for audio, audio_format, sample_rate in synthesized_audio_chunks(http, reply):
-                if call.interrupts != heard or call.ended:
-                    break
-                message = {"type": "audio", "generation_id": generation,
-                           "format": audio_format, "data": base64.b64encode(audio).decode("ascii")}
-                if sample_rate:
-                    message["sample_rate"] = sample_rate
-                await send(call.ws, message)
+            audio_chunks = synthesized_audio_chunks(http, reply)
+            try:
+                async for audio, audio_format, sample_rate in audio_chunks:
+                    if call.interrupts != heard or call.ended:
+                        break
+                    message = {"type": "audio", "generation_id": generation,
+                               "format": audio_format, "data": base64.b64encode(audio).decode("ascii")}
+                    if sample_rate:
+                        message["sample_rate"] = sample_rate
+                    await send(call.ws, message)
+            finally:
+                await audio_chunks.aclose()
             if call.interrupts == heard:
                 await send(call.ws, {"type": "audio_sentence_end", "generation_id": generation})
             await send(call.ws, {"type": "generation_end", "generation_id": generation})
@@ -628,18 +633,22 @@ async def proactive_turn(ws, call: Call, http: aiohttp.ClientSession) -> None:
                 "turn_id": turn_id,
                 "text": reply,
             })
-            async for audio, audio_format, sample_rate in synthesized_audio_chunks(http, reply):
-                if call.interrupts != heard or call.ended:
-                    break
-                message = {
-                    "type": "audio",
-                    "generation_id": generation,
-                    "format": audio_format,
-                    "data": base64.b64encode(audio).decode("ascii"),
-                }
-                if sample_rate:
-                    message["sample_rate"] = sample_rate
-                await send(call.ws, message)
+            audio_chunks = synthesized_audio_chunks(http, reply)
+            try:
+                async for audio, audio_format, sample_rate in audio_chunks:
+                    if call.interrupts != heard or call.ended:
+                        break
+                    message = {
+                        "type": "audio",
+                        "generation_id": generation,
+                        "format": audio_format,
+                        "data": base64.b64encode(audio).decode("ascii"),
+                    }
+                    if sample_rate:
+                        message["sample_rate"] = sample_rate
+                    await send(call.ws, message)
+            finally:
+                await audio_chunks.aclose()
             if call.interrupts == heard:
                 await send(call.ws, {"type": "audio_sentence_end", "generation_id": generation})
             await send(call.ws, {"type": "generation_end", "generation_id": generation})
