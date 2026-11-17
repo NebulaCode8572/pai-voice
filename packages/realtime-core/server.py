@@ -54,8 +54,8 @@ if not AUTH_SECRET:
     if not is_loopback:
         raise RuntimeError("Insecure local mode is only allowed on a loopback bind")
 
-ASR_PROVIDER = os.getenv("PAIVOICE_ASR_PROVIDER", "mock")
-TTS_PROVIDER = os.getenv("PAIVOICE_TTS_PROVIDER", "mock")
+ASR_PROVIDER = os.getenv("PAIVOICE_ASR_PROVIDER", "mock").lower()
+TTS_PROVIDER = os.getenv("PAIVOICE_TTS_PROVIDER", "mock").lower()
 ASR_KEY = os.getenv("PAIVOICE_ASR_API_KEY") or os.getenv("GROQ_API_KEY", "")
 TTS_KEY = os.getenv("PAIVOICE_TTS_API_KEY") or os.getenv("ELEVENLABS_API_KEY", "")
 MINIMAX_KEY = (os.getenv("PAIVOICE_MINIMAX_API_KEY") or os.getenv("PAIVOICE_TTS_API_KEY")
@@ -63,6 +63,7 @@ MINIMAX_KEY = (os.getenv("PAIVOICE_MINIMAX_API_KEY") or os.getenv("PAIVOICE_TTS_
 GROQ_MODEL = os.getenv("PAIVOICE_GROQ_ASR_MODEL", "whisper-large-v3-turbo")
 ELEVEN_VOICE = os.getenv("PAIVOICE_ELEVEN_VOICE_ID", "")
 MINIMAX_BASE_URL = os.getenv("PAIVOICE_MINIMAX_BASE_URL", "https://api.minimaxi.com/v1").rstrip("/")
+MINIMAX_ASR_MODEL = os.getenv("PAIVOICE_MINIMAX_ASR_MODEL", "asr-1.0")
 MINIMAX_MODEL = os.getenv("PAIVOICE_MINIMAX_MODEL", "speech-01-turbo")
 MINIMAX_VOICE = os.getenv("PAIVOICE_MINIMAX_VOICE_ID", "")
 MINIMAX_SPEED = min(2.0, max(0.5, float(os.getenv("PAIVOICE_MINIMAX_SPEED", "1.0"))))
@@ -92,6 +93,26 @@ async def transcribe(http: aiohttp.ClientSession, pcm: bytes) -> str:
     """Return text only. Provider errors are intentionally safe to show."""
     if ASR_PROVIDER == "mock":
         return ""
+    if ASR_PROVIDER == "minimax":
+        if not MINIMAX_KEY:
+            raise RuntimeError("MiniMax ASR API Key 未配置")
+        form = aiohttp.FormData()
+        form.add_field("file", wav(pcm), filename="turn.wav", content_type="audio/wav")
+        form.add_field("model", MINIMAX_ASR_MODEL)
+        form.add_field("response_format", "json")
+        headers = {"Authorization": f"Bearer {MINIMAX_KEY}"}
+        async with http.post(f"{MINIMAX_BASE_URL}/speech_to_text", data=form, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=120)) as response:
+            if response.status != 200:
+                raise RuntimeError(f"MiniMax ASR 请求失败 ({response.status})")
+            result = await response.json()
+        base = result.get("base_resp") or {}
+        if base.get("status_code", 0) not in (0, None):
+            raise RuntimeError(base.get("status_msg") or "MiniMax ASR 识别失败")
+        transcript = result.get("text")
+        if not isinstance(transcript, str):
+            raise RuntimeError("MiniMax ASR 未返回识别文本")
+        return transcript.strip()
     if ASR_PROVIDER != "groq" or not ASR_KEY:
         raise RuntimeError("ASR provider is not configured")
     form = aiohttp.FormData()
