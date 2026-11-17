@@ -168,6 +168,60 @@ class BrowserReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(turn_id, call.pending_replies)
 
 
+class FakeAsrResponse:
+    status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def json(self):
+        return {"text": "识别结果", "duration": 1.2}
+
+    async def text(self):
+        return ""
+
+
+class FakeAsrHttp:
+    def __init__(self):
+        self.url = None
+        self.kwargs = None
+
+    def post(self, url, **kwargs):
+        self.url = url
+        self.kwargs = kwargs
+        return FakeAsrResponse()
+
+
+class MiniMaxAsrTests(unittest.IsolatedAsyncioTestCase):
+    async def test_minimax_asr_uploads_wav_with_server_side_key(self):
+        http = FakeAsrHttp()
+        with (
+            patch.object(server, "ASR_PROVIDER", "minimax"),
+            patch.object(server, "MINIMAX_KEY", "server-secret"),
+            patch.object(server, "MINIMAX_BASE_URL", "https://api.minimaxi.com/v1"),
+            patch.object(server, "MINIMAX_ASR_MODEL", "asr-1.0"),
+        ):
+            result = await server.transcribe(http, b"\\x00\\x00" * 160)
+
+        self.assertEqual(result, "识别结果")
+        self.assertEqual(http.url, "https://api.minimaxi.com/v1/speech_to_text")
+        self.assertEqual(http.kwargs["headers"]["Authorization"], "Bearer server-secret")
+        self.assertEqual(http.kwargs["data"]._fields[1][0].get("name"), "model")
+        self.assertEqual(http.kwargs["data"]._fields[1][2], "asr-1.0")
+        self.assertEqual(http.kwargs["data"]._fields[2][2], "json")
+
+    async def test_minimax_asr_requires_server_side_key(self):
+        with (
+            patch.object(server, "ASR_PROVIDER", "minimax"),
+            patch.object(server, "MINIMAX_KEY", ""),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "API Key 未配置"):
+                await server.transcribe(FakeAsrHttp(), b"\\x00\\x00" * 160)
+
+
 class MiniMaxTtsConfigTests(unittest.TestCase):
     def test_call_voice_settings_are_sanitized_and_secret_fields_ignored(self):
         config = server.normalize_call_tts_config({
