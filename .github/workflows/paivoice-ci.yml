@@ -1,0 +1,27 @@
+name: PaiVoice voice-core checks
+
+on:
+  push:
+    branches:
+      - main
+      - feature/vps-deployment-hardening
+  pull_request:
+
+jobs:
+  voice-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install voice-only dependencies
+        run: python -m pip install -r packages/realtime-core/requirements-voice.txt
+      - name: Run authentication and protocol tests
+        working-directory: packages/realtime-core
+        env:
+          PAIVOICE_AUTH_SECRET: ci-test-secret-that-is-at-least-32-bytes-long
+          PAIVOICE_ALLOWED_ORIGINS: https://app.example.test
+        run: python -m unittest discover -s tests -v
+      - name: Compile Python modules
+        run: python -m compileall -q packages/realtime-core

@@ -14,13 +14,17 @@ PaiVoice 网关（服务器）
   └─ 模型 / Realtime Key：用于模型服务
 ```
 
-浏览器只能获得自己的会话凭证，或由网关代为建立连接；**不要**把 `OPENAI_API_KEY`、转录服务 Key、TTS Key 写进前端代码、PWA 配置、构建产物或移动端包。
+浏览器只能获得自己的短时效通话凭证，或由网关代为建立连接；**不要**把 `PAIVOICE_AUTH_SECRET`、`PAIVOICE_ADAPTER_TOKEN`、`OPENAI_API_KEY`、转录服务 Key、TTS Key 写进前端代码、PWA 配置、构建产物或移动端包。
+
+生产 WebSocket 服务使用 `PAIVOICE_AUTH_SECRET` 验证由 App 后端签发的一次性 HMAC 票据。该密钥必须同时只存在于 PaiVoice 服务端与可信 App 服务端；浏览器只拿到有效期不超过 5 分钟的票据。签发流程和客户端回调见 [VPS 部署指南](VPS-DEPLOYMENT.md)。
 
 ## 环境变量建议
 
 将真实值放在服务器部署环境的 `.env`、systemd `EnvironmentFile`、Docker/云平台 Secret 中；仓库仅保留 `.env.example` 的空变量名。
 
 ```dotenv
+PAIVOICE_AUTH_SECRET=replace-with-random-secret-at-least-32-bytes
+PAIVOICE_ALLOWED_ORIGINS=https://your-app.example
 PAIVOICE_ASR_PROVIDER=groq
 PAIVOICE_TTS_PROVIDER=elevenlabs
 PAIVOICE_ASR_API_KEY=replace-in-server-secret-store

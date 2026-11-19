@@ -12,30 +12,66 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import ipaddress
 import json
+import math
 import os
 import time
 import uuid
 import wave
 from dataclasses import dataclass, field
+from http import HTTPStatus
 
 import aiohttp
 
+from auth import verify_ticket
 from vision import DIFF_THRESHOLD, Eyes
-import numpy as np
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 SAMPLE_RATE = 16_000
 HOST = os.getenv("PAIVOICE_HOST", "127.0.0.1")
-PORT = int(os.getenv("PAIVOICE_PORT", "8780"))
-TOKEN = os.getenv("PAIVOICE_TOKEN", "")
-ASR_PROVIDER = os.getenv("PAIVOICE_ASR_PROVIDER", "mock")
-TTS_PROVIDER = os.getenv("PAIVOICE_TTS_PROVIDER", "mock")
+PORT = int(os.getenv("PAIVOICE_PORT") or os.getenv("PORT") or "8780")
+AUTH_SECRET = os.getenv("PAIVOICE_AUTH_SECRET", "")
+ALLOW_INSECURE_LOCAL = os.getenv("PAIVOICE_ALLOW_INSECURE_LOCAL", "").lower() in ("1", "true", "yes")
+ALLOWED_ORIGINS = [x.strip() for x in os.getenv("PAIVOICE_ALLOWED_ORIGINS", "").split(",") if x.strip()]
+VIDEO_ENABLED = os.getenv("PAIVOICE_ENABLE_VIDEO", "false").lower() in ("1", "true", "yes")
+USED_TICKETS: dict[str, int] = {}
+
+if AUTH_SECRET and len(AUTH_SECRET.encode("utf-8")) < 32:
+    raise RuntimeError("PAIVOICE_AUTH_SECRET must contain at least 32 bytes")
+if AUTH_SECRET and not ALLOWED_ORIGINS:
+    raise RuntimeError("PAIVOICE_ALLOWED_ORIGINS must contain the exact App origin(s)")
+if "*" in ALLOWED_ORIGINS:
+    raise RuntimeError("PAIVOICE_ALLOWED_ORIGINS does not allow wildcard origins")
+if not AUTH_SECRET:
+    if not ALLOW_INSECURE_LOCAL:
+        raise RuntimeError("PAIVOICE_AUTH_SECRET is required; see docs/VPS-DEPLOYMENT.md")
+    try:
+        is_loopback = HOST == "localhost" or ipaddress.ip_address(HOST).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        raise RuntimeError("Insecure local mode is only allowed on a loopback bind")
+
+ASR_PROVIDER = os.getenv("PAIVOICE_ASR_PROVIDER", "mock").lower()
+TTS_PROVIDER = os.getenv("PAIVOICE_TTS_PROVIDER", "mock").lower()
 ASR_KEY = os.getenv("PAIVOICE_ASR_API_KEY") or os.getenv("GROQ_API_KEY", "")
 TTS_KEY = os.getenv("PAIVOICE_TTS_API_KEY") or os.getenv("ELEVENLABS_API_KEY", "")
+MINIMAX_KEY = (os.getenv("PAIVOICE_MINIMAX_API_KEY") or os.getenv("PAIVOICE_TTS_API_KEY")
+               or os.getenv("MINIMAX_API_KEY", ""))
 GROQ_MODEL = os.getenv("PAIVOICE_GROQ_ASR_MODEL", "whisper-large-v3-turbo")
 ELEVEN_VOICE = os.getenv("PAIVOICE_ELEVEN_VOICE_ID", "")
+MINIMAX_BASE_URL = os.getenv("PAIVOICE_MINIMAX_BASE_URL", "https://api.minimaxi.com/v1").rstrip("/")
+MINIMAX_ASR_MODEL = os.getenv("PAIVOICE_MINIMAX_ASR_MODEL", "asr-1.0")
+MINIMAX_MODEL = os.getenv("PAIVOICE_MINIMAX_MODEL", "speech-01-turbo")
+MINIMAX_VOICE = os.getenv("PAIVOICE_MINIMAX_VOICE_ID", "")
+MINIMAX_SPEED = min(2.0, max(0.5, float(os.getenv("PAIVOICE_MINIMAX_SPEED", "1.0"))))
+MINIMAX_PITCH = min(12, max(-12, int(os.getenv("PAIVOICE_MINIMAX_PITCH", "0"))))
+MINIMAX_EMOTION = os.getenv("PAIVOICE_MINIMAX_EMOTION", "").strip().lower()
+MINIMAX_LANGUAGE_BOOST = os.getenv("PAIVOICE_MINIMAX_LANGUAGE_BOOST", "").strip()
+MINIMAX_STREAM = os.getenv("PAIVOICE_MINIMAX_STREAM", "true").lower() in ("1", "true", "yes")
+MINIMAX_EMOTIONS = {"happy", "sad", "angry", "fearful", "disgusted", "surprised", "calm", "neutral", "fluent"}
 ADAPTER_URL = os.getenv("PAIVOICE_ADAPTER_URL", "")
 ADAPTER_TOKEN = os.getenv("PAIVOICE_ADAPTER_TOKEN", "")
 MAX_TURN_SECONDS = int(os.getenv("PAIVOICE_MAX_TURN_SECONDS", "60"))
@@ -57,6 +93,26 @@ async def transcribe(http: aiohttp.ClientSession, pcm: bytes) -> str:
     """Return text only. Provider errors are intentionally safe to show."""
     if ASR_PROVIDER == "mock":
         return ""
+    if ASR_PROVIDER == "minimax":
+        if not MINIMAX_KEY:
+            raise RuntimeError("MiniMax ASR API Key 未配置")
+        form = aiohttp.FormData()
+        form.add_field("file", wav(pcm), filename="turn.wav", content_type="audio/wav")
+        form.add_field("model", MINIMAX_ASR_MODEL)
+        form.add_field("response_format", "json")
+        headers = {"Authorization": f"Bearer {MINIMAX_KEY}"}
+        async with http.post(f"{MINIMAX_BASE_URL}/speech_to_text", data=form, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=120)) as response:
+            if response.status != 200:
+                raise RuntimeError(f"MiniMax ASR 请求失败 ({response.status})")
+            result = await response.json()
+        base = result.get("base_resp") or {}
+        if base.get("status_code", 0) not in (0, None):
+            raise RuntimeError(base.get("status_msg") or "MiniMax ASR 识别失败")
+        transcript = result.get("text")
+        if not isinstance(transcript, str):
+            raise RuntimeError("MiniMax ASR 未返回识别文本")
+        return transcript.strip()
     if ASR_PROVIDER != "groq" or not ASR_KEY:
         raise RuntimeError("ASR provider is not configured")
     form = aiohttp.FormData()
@@ -90,10 +146,192 @@ async def request_reply(http: aiohttp.ClientSession, turn: dict) -> str:
     return str(result.get("reply", "")).strip()
 
 
-async def synthesize(http: aiohttp.ClientSession, text: str) -> bytes | None:
-    """ElevenLabs is optional. Without a TTS provider, the client still gets text."""
+def normalize_call_tts_config(value: object) -> dict:
+    """Accept only non-secret MiniMax synthesis settings from the App client."""
+    if not isinstance(value, dict):
+        return {}
+    result: dict = {}
+    model = value.get("model")
+    if isinstance(model, str) and 0 < len(model) <= 64 and all(c.isalnum() or c in "-_." for c in model):
+        result["model"] = model
+    voice_id = value.get("voice_id")
+    if isinstance(voice_id, str) and 0 < len(voice_id) <= 128 and all(c.isalnum() or c in "-_." for c in voice_id):
+        result["voice_id"] = voice_id
+    try:
+        speed = float(value.get("speed", MINIMAX_SPEED))
+        if speed == speed and abs(speed) != float("inf"):
+            result["speed"] = min(2.0, max(0.5, speed))
+    except (TypeError, ValueError):
+        pass
+    try:
+        pitch = float(value.get("pitch", MINIMAX_PITCH))
+        if pitch == pitch and abs(pitch) != float("inf"):
+            result["pitch"] = min(12, max(-12, math.floor(pitch + 0.5)))
+    except (TypeError, ValueError):
+        pass
+    language = value.get("language_boost")
+    if isinstance(language, str) and len(language) <= 32 and all(c.isalnum() or c in "-_ " for c in language):
+        result["language_boost"] = language.strip()
+    return result
+
+
+def clean_minimax_text(text: str) -> str:
+    """Match Float's MiniMax text wrapper cleanup exactly."""
+    clean = text.strip()
+    for prefix in ("[语音条:", "[语音条："):
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+            break
+    if clean.endswith("]"):
+        clean = clean[:-1]
+    return clean.strip()
+
+
+def minimax_voice_setting(tts_config: dict | None = None) -> dict:
+    config = tts_config or {}
+    voice_id = config.get("voice_id") or MINIMAX_VOICE
+    if not voice_id:
+        raise RuntimeError("MiniMax TTS Voice ID 未配置")
+    voice = {
+        "voice_id": voice_id,
+        "speed": config.get("speed", MINIMAX_SPEED),
+        "vol": 1.0,
+        "pitch": config.get("pitch", MINIMAX_PITCH),
+    }
+    if MINIMAX_EMOTION in MINIMAX_EMOTIONS:
+        voice["emotion"] = MINIMAX_EMOTION
+    return voice
+
+
+def minimax_request_body(text: str, *, stream: bool, tts_config: dict | None = None) -> dict:
+    config = tts_config or {}
+    body = {
+        "model": config.get("model") or MINIMAX_MODEL,
+        "text": clean_minimax_text(text),
+        "stream": stream,
+        "voice_setting": minimax_voice_setting(config),
+        "audio_setting": {
+            "sample_rate": 44_100,
+            "format": "pcm" if stream else "mp3",
+            "channel": 1,
+            **({} if stream else {"bitrate": 256_000}),
+        },
+    }
+    language_boost = config.get("language_boost") or MINIMAX_LANGUAGE_BOOST
+    if language_boost:
+        body["language_boost"] = language_boost
+    if stream:
+        # Avoid a second, aggregated copy of the complete audio at stream end.
+        body["stream_options"] = {"exclude_aggregated_audio": True}
+    return body
+
+
+async def minimax_synthesize(http: aiohttp.ClientSession, text: str, tts_config: dict | None = None) -> bytes:
+    if not MINIMAX_KEY:
+        raise RuntimeError("MiniMax TTS API Key 未配置")
+    minimax_voice_setting(tts_config)
+    headers = {"Authorization": f"Bearer {MINIMAX_KEY}", "Content-Type": "application/json"}
+    async with http.post(f"{MINIMAX_BASE_URL}/t2a_v2", headers=headers,
+                         json=minimax_request_body(text, stream=False, tts_config=tts_config),
+                         timeout=aiohttp.ClientTimeout(total=120)) as response:
+        if response.status != 200:
+            detail = await response.text()
+            raise RuntimeError(f"MiniMax TTS 请求失败 ({response.status}): {detail[:300]}")
+        result = await response.json()
+    status = (result.get("base_resp") or {}).get("status_code", 0)
+    if status not in (0, None):
+        raise RuntimeError((result.get("base_resp") or {}).get("status_msg") or "MiniMax TTS 合成失败")
+    audio_hex = (result.get("data") or {}).get("audio", "")
+    if not audio_hex:
+        raise RuntimeError((result.get("base_resp") or {}).get("status_msg") or "MiniMax 未返回音频")
+    try:
+        return bytes.fromhex(audio_hex)
+    except ValueError as error:
+        raise RuntimeError("MiniMax 返回了无效的音频数据") from error
+
+
+async def minimax_stream(http: aiohttp.ClientSession, text: str, tts_config: dict | None = None):
+    """Yield signed 16-bit PCM chunks from MiniMax SSE as soon as they arrive."""
+    if not MINIMAX_KEY:
+        raise RuntimeError("MiniMax TTS API Key 未配置")
+    minimax_voice_setting(tts_config)
+    headers = {"Authorization": f"Bearer {MINIMAX_KEY}", "Content-Type": "application/json",
+               "Accept": "text/event-stream"}
+    body = minimax_request_body(text, stream=True, tts_config=tts_config)
+    saw_audio = False
+    pending = b""
+
+    async with http.post(f"{MINIMAX_BASE_URL}/t2a_v2", headers=headers, json=body,
+                         timeout=aiohttp.ClientTimeout(total=120)) as response:
+        if response.status != 200:
+            detail = await response.text()
+            raise RuntimeError(f"MiniMax TTS 流式请求失败 ({response.status}): {detail[:300]}")
+        async for network_chunk in response.content.iter_any():
+            pending += network_chunk
+            while b"\n" in pending:
+                raw_line, pending = pending.split(b"\n", 1)
+                line = raw_line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == b"[DONE]":
+                    continue
+                try:
+                    event = json.loads(payload.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                base = event.get("base_resp") or {}
+                if base.get("status_code", 0) not in (0, None):
+                    raise RuntimeError(base.get("status_msg") or "MiniMax TTS 流式合成失败")
+                data = event.get("data") or {}
+                audio_hex = data.get("audio") or ""
+                if audio_hex:
+                    try:
+                        chunk = bytes.fromhex(audio_hex)
+                    except ValueError as error:
+                        raise RuntimeError("MiniMax 返回了无效的 PCM 音频片段") from error
+                    if chunk:
+                        saw_audio = True
+                        yield chunk
+        if pending.strip().startswith(b"data:"):
+            payload = pending.strip()[5:].strip()
+            if payload and payload != b"[DONE]":
+                event = json.loads(payload.decode("utf-8"))
+                base = event.get("base_resp") or {}
+                if base.get("status_code", 0) not in (0, None):
+                    raise RuntimeError(base.get("status_msg") or "MiniMax TTS 流式合成失败")
+                audio_hex = (event.get("data") or {}).get("audio") or ""
+                if audio_hex:
+                    chunk = bytes.fromhex(audio_hex)
+                    if chunk:
+                        saw_audio = True
+                        yield chunk
+    if not saw_audio:
+        raise RuntimeError("MiniMax 流式合成未返回音频片段")
+
+
+async def synthesized_audio_chunks(http: aiohttp.ClientSession, text: str, tts_config: dict | None = None):
+    """Yield (audio bytes, wire format, sample rate); PCM can play before TTS finishes."""
+    if TTS_PROVIDER == "mock" or not text:
+        return
+    if TTS_PROVIDER == "minimax":
+        if MINIMAX_STREAM:
+            async for chunk in minimax_stream(http, text, tts_config):
+                yield chunk, "pcm_s16le", 44_100
+        else:
+            yield await minimax_synthesize(http, text, tts_config), "mp3", None
+        return
+    audio = await synthesize(http, text, tts_config)
+    if audio:
+        yield audio, "mp3", None
+
+
+async def synthesize(http: aiohttp.ClientSession, text: str, tts_config: dict | None = None) -> bytes | None:
+    """Non-streaming fallback for providers that return a complete audio file."""
     if TTS_PROVIDER == "mock" or not text:
         return None
+    if TTS_PROVIDER == "minimax":
+        return await minimax_synthesize(http, text, tts_config)
     if TTS_PROVIDER != "elevenlabs" or not TTS_KEY or not ELEVEN_VOICE:
         raise RuntimeError("TTS provider is not configured")
     headers = {"xi-api-key": TTS_KEY, "accept": "audio/mpeg", "content-type": "application/json"}
@@ -174,8 +412,11 @@ class Call:
     detached_at: float = 0.0                  # 连接断开的时间（等接回中）
     end_task: object = None                   # 等接回的倒计时
     ended: bool = False
+    user_id: str = ""
+    tts_config: dict = field(default_factory=dict)   # safe per-call MiniMax settings; never contains provider credentials
     watch_title: str = ""                     # 一起看电影：前端告诉的片名；空 = 普通屏幕共享
     interrupts: int = 0                       # 对方开口打断的次数：只停正在念的那句，排着的照念
+    pending_replies: dict[str, asyncio.Future] = field(default_factory=dict)  # 等待浏览器端 LLM 返回的回合
     speak_lock: asyncio.Lock = field(default_factory=asyncio.Lock)   # 回复一句一句按顺序念，后到的不顶掉先到的
 
     def companion_reset(self) -> None:
@@ -186,10 +427,22 @@ class Call:
         self.active = True
         self.audio.clear()
 
+    def append_audio(self, chunk: bytes) -> None:
+        """Keep at most MAX_TURN_SECONDS of PCM in memory per call."""
+        if not self.active or not chunk:
+            return
+        max_bytes = SAMPLE_RATE * 2 * MAX_TURN_SECONDS
+        if len(chunk) >= max_bytes:
+            self.audio = bytearray(chunk[-max_bytes:])
+            return
+        overflow = len(self.audio) + len(chunk) - max_bytes
+        if overflow > 0:
+            del self.audio[:overflow]
+        self.audio.extend(chunk)
+
     def end_turn(self) -> bytes:
         self.active = False
-        max_bytes = SAMPLE_RATE * 2 * MAX_TURN_SECONDS
-        return bytes(self.audio[-max_bytes:])
+        return bytes(self.audio)
 
 
 SCREEN_INTRO = ("对方共享了屏幕，可能在看剧、玩游戏或看网页，想和你一起看。大约每 {secs} 秒来一条 screen 事件："
@@ -295,11 +548,22 @@ async def send(ws, message: dict) -> None:
         pass
 
 
+def has_active_call_for_user(user_id: str) -> bool:
+    """The App exposes one active call per account; enforce the same limit at the service."""
+    if not user_id:
+        return False
+    return any(not call.ended and call.user_id == user_id for call in CALLS.values())
+
+
 async def end_call(call: "Call", http: aiohttp.ClientSession | None, reason: str) -> None:
     """真挂了：挂断键，或者断线后 RESUME_WINDOW 秒没接回。只走一次。"""
     if call.ended:
         return
     call.ended = True
+    for future in list(call.pending_replies.values()):
+        if not future.done():
+            future.cancel()
+    call.pending_replies.clear()
     CALLS.pop(call.id, None)
     if call.end_task and call.end_task is not asyncio.current_task():
         call.end_task.cancel()
@@ -329,56 +593,186 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
         await send(call.ws, {"type": "nothing_heard"})
         return
     turn_id = uuid.uuid4().hex
+    heard = call.interrupts
+    reply_future = None
+    cancelled = False
     try:
         transcript = supplied_text or await transcribe(http, pcm)
         if not transcript:
             await send(call.ws, {"type": "nothing_heard"})
             return
+        if call.ended or call.interrupts != heard:
+            return
+        # 先登记 Future 再发 transcript，避免浏览器端模型很快返回时发生竞态。
+        reply_future = asyncio.get_running_loop().create_future()
+        call.pending_replies[turn_id] = reply_future
         await send(call.ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
         turn = {"call_session_id": call.id, "turn_id": turn_id, "transcript": transcript}
         if call.video and call.eyes.last_observation:
             turn["observation"] = call.eyes.last_observation      # 最近一次看到的画面，随这轮一起给回复端
-        reply = await request_reply(http, turn)
-        if not reply:
+
+        # App 端沿用它现有的浏览器侧聊天引擎生成角色回复，再把结果回传。
+        # 若浏览器端未能返回，才回退到可选的服务端 Adapter。
+        try:
+            reply = await asyncio.wait_for(reply_future, timeout=120)
+        except asyncio.TimeoutError:
+            await send(call.ws, {"type": "reply_timeout", "turn_id": turn_id})
+            if not ADAPTER_URL:
+                raise RuntimeError("App reply timed out")
+            reply = await request_reply(http, turn)
+
+        if call.interrupts != heard or not reply:
             return
-        # 不掐掉：对方连着说了几句，每句各自去问回复端；回来的话排队，按到达顺序一句一句念完。
-        # 只有对方开口打断（interrupt）才停——而且只停当时正在念的那句，后面排着的照念。
+
+        # 不掐掉：对方连着说了几句，每句各自生成；回来的话排队，按到达顺序一句一句念完。
         async with call.speak_lock:
-            heard = call.interrupts
+            if call.interrupts != heard or call.ended:
+                return
             call.generation += 1
             generation = call.generation
             await send(call.ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": reply})
-            audio = await synthesize(http, reply)
-            if audio and call.interrupts == heard:
-                await send(call.ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
+            audio_chunks = synthesized_audio_chunks(http, reply, call.tts_config)
+            try:
+                async for audio, audio_format, sample_rate in audio_chunks:
+                    if call.interrupts != heard or call.ended:
+                        break
+                    message = {"type": "audio", "generation_id": generation,
+                               "format": audio_format, "data": base64.b64encode(audio).decode("ascii")}
+                    if sample_rate:
+                        message["sample_rate"] = sample_rate
+                    await send(call.ws, message)
+            finally:
+                await audio_chunks.aclose()
+            if call.interrupts == heard:
                 await send(call.ws, {"type": "audio_sentence_end", "generation_id": generation})
             await send(call.ws, {"type": "generation_end", "generation_id": generation})
+    except asyncio.CancelledError:
+        cancelled = True
     except Exception as error:  # do not serialize credentials or provider bodies
         await send(call.ws, {"type": "error", "error": str(error)})
     finally:
-        await send(call.ws, {"type": "state", "mode": "listening"})
+        if reply_future is not None and call.pending_replies.get(turn_id) is reply_future:
+            call.pending_replies.pop(turn_id, None)
+        if not cancelled:
+            await send(call.ws, {"type": "state", "mode": "listening"})
+
+
+async def proactive_turn(ws, call: Call, http: aiohttp.ClientSession) -> None:
+    """Ask the connected App to generate a character-initiated first utterance."""
+    turn_id = uuid.uuid4().hex
+    heard = call.interrupts
+    reply_future = asyncio.get_running_loop().create_future()
+    call.pending_replies[turn_id] = reply_future
+    cancelled = False
+    try:
+        await send(call.ws, {"type": "state", "mode": "thinking"})
+        await send(call.ws, {"type": "proactive_turn", "call_session_id": call.id, "turn_id": turn_id})
+        try:
+            reply = await asyncio.wait_for(reply_future, timeout=120)
+        except asyncio.TimeoutError:
+            await send(call.ws, {"type": "reply_timeout", "turn_id": turn_id})
+            if not ADAPTER_URL:
+                raise RuntimeError("App proactive reply timed out")
+            reply = await request_reply(http, {
+                "call_session_id": call.id,
+                "turn_id": turn_id,
+                "transcript": "",
+                "proactive": True,
+            })
+
+        if call.ended or call.interrupts != heard or not reply:
+            return
+
+        async with call.speak_lock:
+            if call.ended or call.interrupts != heard:
+                return
+            call.generation += 1
+            generation = call.generation
+            await send(call.ws, {
+                "type": "reply_text",
+                "generation_id": generation,
+                "turn_id": turn_id,
+                "text": reply,
+            })
+            audio_chunks = synthesized_audio_chunks(http, reply, call.tts_config)
+            try:
+                async for audio, audio_format, sample_rate in audio_chunks:
+                    if call.interrupts != heard or call.ended:
+                        break
+                    message = {
+                        "type": "audio",
+                        "generation_id": generation,
+                        "format": audio_format,
+                        "data": base64.b64encode(audio).decode("ascii"),
+                    }
+                    if sample_rate:
+                        message["sample_rate"] = sample_rate
+                    await send(call.ws, message)
+            finally:
+                await audio_chunks.aclose()
+            if call.interrupts == heard:
+                await send(call.ws, {"type": "audio_sentence_end", "generation_id": generation})
+            await send(call.ws, {"type": "generation_end", "generation_id": generation})
+    except asyncio.CancelledError:
+        cancelled = True
+    except Exception as error:
+        await send(call.ws, {"type": "error", "error": str(error)})
+    finally:
+        if call.pending_replies.get(turn_id) is reply_future:
+            call.pending_replies.pop(turn_id, None)
+        if not cancelled and not call.ended:
+            await send(call.ws, {"type": "state", "mode": "listening"})
 
 
 async def session(ws) -> None:
     call = Call()
     explicit = False
+    authenticated = False
+    user_id = ""
     async with aiohttp.ClientSession() as http:
         try:
             async for raw in ws:
                 if isinstance(raw, bytes):
-                    if call.active:
-                        call.audio.extend(raw)
+                    if not authenticated:
+                        await ws.close(code=4401, reason="authentication required")
+                        return
+                    call.append_audio(raw)
                     continue
                 try:
                     event = json.loads(raw)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(event, dict):
                     continue
                 kind = event.get("type")
+                first_start = False
+                if not authenticated:
+                    if kind != "start":
+                        await send(ws, {"type": "error", "error": "Authentication must be the first message"})
+                        await ws.close(code=4401, reason="authentication required")
+                        return
+                    if AUTH_SECRET:
+                        try:
+                            claims = verify_ticket(event.get("ticket", ""), AUTH_SECRET, used_jti=USED_TICKETS)
+                        except ValueError:
+                            await send(ws, {"type": "error", "error": "Unauthorized"})
+                            await ws.close(code=4401, reason="invalid ticket")
+                            return
+                        user_id = claims["sub"]
+                    else:
+                        user_id = "local-development"
+                    authenticated = True
+                    first_start = True
                 if kind == "start":
-                    if TOKEN and event.get("token") != TOKEN:
-                        await send(ws, {"type": "error", "error": "Unauthorized"})
+                    if not first_start:
+                        await send(ws, {"type": "error", "error": "A call is already started on this connection"})
                         return
                     old = CALLS.get(str(event.get("resume") or ""))
+                    if old is not None and not old.ended:
+                        if old.user_id != user_id:
+                            await send(ws, {"type": "error", "error": "Resume is not authorized"})
+                            await ws.close(code=4403, reason="resume not authorized")
+                            return
                     if old is not None and not old.ended:
                         # 断线接回：接着同一通，摄像头 / 屏幕共享 / 片名这些状态都在 old 上。
                         # 旧连接还挂着（手机先连上新的、旧的还没断）：新连接接管，旧连接关掉、不算挂断
@@ -389,6 +783,7 @@ async def session(ws) -> None:
                             old.end_task = None
                         old.active, old.audio = False, bytearray()
                         call = old
+                        call.tts_config = normalize_call_tts_config(event.get("tts_config"))
                         if prev is not None and prev is not ws:
                             try:
                                 await prev.close(code=4000, reason="replaced by a new connection")
@@ -398,10 +793,18 @@ async def session(ws) -> None:
                                         "video": call.video, "video_mode": call.video_mode, "watch_title": call.watch_title})
                         await notify_adapter(http, {"type": "call_resumed", "call_session_id": call.id, "gap_s": gap})
                     else:
+                        if has_active_call_for_user(user_id):
+                            await send(ws, {"type": "error", "error": "This account already has an active call"})
+                            await ws.close(code=4409, reason="active call limit reached")
+                            return
                         call.ws = ws
+                        call.user_id = user_id
+                        call.tts_config = normalize_call_tts_config(event.get("tts_config"))
                         CALLS[call.id] = call
                         await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening"})
                         await notify_adapter(http, {"type": "call_start", "call_session_id": call.id})   # 来电接通：先告诉回复端
+                elif kind in ("video", "watch", "video_mode", "frame") and not VIDEO_ENABLED:
+                    await send(ws, {"type": "feature_disabled", "feature": "video"})
                 elif kind == "speech_start":
                     call.begin_turn()
                 elif kind == "speech_end":
@@ -412,9 +815,22 @@ async def session(ws) -> None:
                 elif kind == "text":
                     await send(ws, {"type": "state", "mode": "thinking"})
                     asyncio.create_task(answer_turn(ws, call, http, b"", str(event.get("text", ""))))
+                elif kind == "proactive":
+                    # If the user has already started speaking, their turn takes priority.
+                    if not call.ended and not call.active:
+                        asyncio.create_task(proactive_turn(ws, call, http))
+                elif kind == "client_reply":
+                    turn_id = str(event.get("turn_id") or "")
+                    reply_text = event.get("text")
+                    future = call.pending_replies.get(turn_id)
+                    if future is not None and not future.done() and isinstance(reply_text, str):
+                        future.set_result(reply_text.strip()[:20000])
                 elif kind == "interrupt":
                     call.interrupts += 1
                     call.generation += 1
+                    for future in list(call.pending_replies.values()):
+                        if not future.done():
+                            future.cancel()
                     await send(ws, {"type": "interrupted"})
                 elif kind == "video":
                     on = bool(event.get("on"))
@@ -491,8 +907,24 @@ async def session(ws) -> None:
             # call.ws 已经是别的连接：被新连接接管了，什么都不做
 
 
+async def health_check(connection, request):
+    """Minimal HTTP health endpoint for reverse proxies and service monitors."""
+    if request.path == "/healthz":
+        return connection.respond(HTTPStatus.OK, "OK\n")
+
+
 async def main() -> None:
-    async with serve(session, HOST, PORT, max_size=None):
+    async with serve(
+        session,
+        HOST,
+        PORT,
+        origins=ALLOWED_ORIGINS or None,
+        process_request=health_check,
+        max_size=1_048_576,
+        max_queue=16,
+        ping_interval=20,
+        ping_timeout=20,
+    ):
         print(f"PaiVoice listening on ws://{HOST}:{PORT}")
         await asyncio.Future()
 
