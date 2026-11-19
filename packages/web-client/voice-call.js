@@ -48,10 +48,16 @@ registerProcessor('pcm-capture', PcmCapture);
 const MIC_CONSTRAINTS = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
 
 export class VoiceCall {
-  constructor({ url, video = false, on = {}, vad = {} } = {}) {
+  constructor({ url, video = false, on = {}, vad = {}, getAuthTicket = null, pushToTalk = false } = {}) {
     this.url = url;
     this.wantVideo = video;
     this.on = on;
+    this.getAuthTicket = getAuthTicket;
+    this.authTicket = null;
+    this.pushToTalk = Boolean(pushToTalk);
+    this.pushToTalkActive = false;
+    this.speakerMuted = false;
+    this._pendingReplies = [];
     this.vad = Object.assign({
       startHold: 3,        // 连续几块（~20ms/块）超阈值算开口
       endSilenceMs: 650,   // 静音多久算说完
@@ -106,6 +112,7 @@ export class VoiceCall {
     const workletUrl = URL.createObjectURL(blob);
     await this.ctx.audioWorklet.addModule(workletUrl);
     this.outGain = this.ctx.createGain();
+    this.outGain.gain.value = this.speakerMuted ? 0 : 1;
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 512;
     this.outGain.connect(this.analyser);
@@ -136,12 +143,21 @@ export class VoiceCall {
     }
 
     await this._connect();
-    this._send({ type: 'start', video: this.wantVideo, sample_rate: 16000 });
+    this._send({ type: 'start', ticket: this.authTicket || undefined, video: this.wantVideo, sample_rate: 16000 });
+    this._flushPendingReplies();
     this._setMode('listening');
     if (this.video) this._startFrames();
   }
 
-  _connect() {
+  async _connect() {
+    // Obtain a fresh, short-lived, single-use ticket from the trusted App backend.
+    // The long-lived HMAC signing secret must never be present in this browser client.
+    this.authTicket = typeof this.getAuthTicket === 'function'
+      ? await this.getAuthTicket()
+      : null;
+    if (typeof this.getAuthTicket === 'function' && (!this.authTicket || typeof this.authTicket !== 'string')) {
+      throw new Error('通话授权凭证无效');
+    }
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.url);
       ws.binaryType = 'arraybuffer';
@@ -162,6 +178,7 @@ export class VoiceCall {
   /** 意外断线：麦克风、画面都留着，隔几秒重连一次、带上 call_session_id，接回就接着同一通。 */
   async _reconnect() {
     if (this._reconnecting) return;
+    if (this.pushToTalkActive) this.setPushToTalk(false);
     this._reconnecting = true;
     this._stopPlayback();
     this._setMode('reconnecting');
@@ -171,7 +188,8 @@ export class VoiceCall {
     while (!this._hungUp && Date.now() < deadline) {
       try {
         await this._connect();
-        this._send({ type: 'start', resume: this.callSessionId, video: !!this.video, sample_rate: 16000 });
+        this._send({ type: 'start', ticket: this.authTicket || undefined, resume: this.callSessionId, video: !!this.video, sample_rate: 16000 });
+        this._flushPendingReplies();
         this._reconnecting = false;
         this._setMode('listening');
         this.emit('resumed');
@@ -189,11 +207,40 @@ export class VoiceCall {
 
   _send(obj) { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(obj)); }
 
+  /** Send the App-generated character response back to the core for TTS playback. */
+  sendReply(text, turnId) {
+    const clean = String(text || '').trim();
+    if (!clean || this._hungUp) return false;
+    const event = { type: 'client_reply', turn_id: String(turnId || ''), text: clean };
+    if (this.ws && this.ws.readyState === 1) this._send(event);
+    else this._pendingReplies.push(event);
+    return true;
+  }
+
+  /** Ask the App to generate the character's first utterance after an incoming call is accepted. */
+  startProactiveTurn() {
+    if (this._hungUp || !this.ws || this.ws.readyState !== 1) return false;
+    this._send({ type: 'proactive' });
+    return true;
+  }
+
+  _flushPendingReplies() {
+    while (this._pendingReplies.length && this.ws && this.ws.readyState === 1) {
+      this._send(this._pendingReplies.shift());
+    }
+  }
+
   _setMode(m) { if (this.mode !== m) { this.mode = m; this.emit('state', m); } }
 
   // ------------------------------------------------------------ 听（Listen 轨 + VAD）
   _onCapture({ pcm, rms }) {
     if (this.muted) { this.emit('level', 0); return; }
+    if (this.pushToTalk) {
+      if (!this.pushToTalkActive) { this.emit('level', 0); return; }
+      if (pcm && this.ws && this.ws.readyState === 1) this.ws.send(pcm);
+      if (rms !== undefined) this.emit('level', rms);
+      return;
+    }
     if (pcm && this.ws && this.ws.readyState === 1) this.ws.send(pcm);   // 二进制 PCM16
     if (rms === undefined) return;
     this.emit('level', rms);
@@ -340,8 +387,28 @@ export class VoiceCall {
     this.stream.getVideoTracks().forEach((t) => { try { t.stop(); } catch { /* ignore */ } this.stream.removeTrack(t); });
   }
 
+  /** Push-to-talk: audio is transmitted only while the user holds the control. */
+  setPushToTalk(pressed) {
+    if (!this.pushToTalk) return;
+    const next = Boolean(pressed) && !this.muted && !!this.ws && this.ws.readyState === 1;
+    if (next === this.pushToTalkActive) return;
+    this.pushToTalkActive = next;
+    if (this.stream) {
+      for (const track of this.stream.getAudioTracks()) track.enabled = next;
+    }
+    if (next) this._speechStart();
+    else if (this.speaking) this._speechEnd();
+  }
+
+  /** Mute only the received audio output; this does not change the device route. */
+  setSpeakerMuted(yes) {
+    this.speakerMuted = Boolean(yes);
+    if (this.outGain) this.outGain.gain.value = this.speakerMuted ? 0 : 1;
+  }
+
   /** 静音 = 真把音轨停掉（iOS 的麦克风指示灯只认这个）；取消静音时重新拿一次麦克风接回 worklet。 */
   async setMuted(yes) {
+    if (yes && this.pushToTalkActive) this.setPushToTalk(false);
     this.muted = Boolean(yes);
     if (!this.stream) return;
     if (this.muted) {
@@ -363,6 +430,7 @@ export class VoiceCall {
 
   _attachMic(track) {
     if (!track || !this.ctx || !this.node) return;
+    if (this.pushToTalk) track.enabled = this.pushToTalkActive;
     if (this._micSrc) { try { this._micSrc.disconnect(); } catch { /* ignore */ } }
     this._micSrc = this.ctx.createMediaStreamSource(new MediaStream([track]));
     this._micSrc.connect(this.node);
@@ -383,7 +451,7 @@ export class VoiceCall {
     this.speaking = true; this._speechMin = 1; this._lastHotAt = performance.now(); this._silenceSince = 0;
     this.emit('speech', true);
     // 只在听得到正式回复时打断；思考中、短提示音或误触都让机继续准备。
-    const barge = this.playing && this.mode === 'speaking';
+    const barge = (this.playing && this.mode === 'speaking') || (this.pushToTalk && this.mode === 'thinking');
     if (barge) {
       this._stopPlayback();
       this._send({ type: 'interrupt', turn_id: 'new' });
@@ -418,6 +486,7 @@ export class VoiceCall {
         if (msg.mode) this._setMode(msg.mode === 'speaking' && !this.playing ? 'thinking' : msg.mode);
         break;
       case 'transcript': this.stats.turns += 1; this.emit('transcript', msg); break;
+      case 'proactive_turn': this.emit('proactiveTurn', msg); break;
       case 'prosody': this.emit('prosody', msg); break;
       case 'reply_text':
         if (msg.generation_id !== this.generationId) { this.generationId = msg.generation_id; }
@@ -427,6 +496,7 @@ export class VoiceCall {
       case 'generation_end': this._flushSentence(msg.generation_id); this._pending.delete(msg.generation_id); break;
       case 'interrupted': this._stopPlayback(); this.emit('interrupted', msg); break;
       case 'nothing_heard': this.emit('nothingHeard', msg); break;
+      case 'reply_timeout': this.emit('replyTimeout', msg); break;
       case 'observation': this.emit('observation', msg); break;   // 机看到的画面描述：前端可选择显示或只留事件
       case 'video': this.emit('videoState', msg); break;
       case 'video_mode': this.emit('videoMode', msg.mode); break;
@@ -536,6 +606,7 @@ export class VoiceCall {
 
   // ------------------------------------------------------------ 挂断
   hangup() {
+    if (this.pushToTalkActive) this.setPushToTalk(false);
     this._hungUp = true;
     this._send({ type: 'hangup' });
     this._stopPlayback();

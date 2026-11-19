@@ -16,13 +16,23 @@ interface VoiceAdapter {
 }
 ```
 
+## 连接认证（生产环境必需）
+
+每条 WebSocket 连接的第一条消息必须是 `start`，生产环境必须带有短时效的一次性 `ticket`：
+
+```json
+{"type":"start","ticket":"<short-lived-ticket>","video":false,"sample_rate":16000}
+```
+
+票据由可信 App 后端签发，包含当前用户 `sub`、`aud=paivoice`、`iat`、`exp`（最多 300 秒）和唯一 `jti`。每次断线重连都要重新申请票据；重连票据的用户必须与原通话用户一致。不要将 HMAC 签名密钥放进浏览器。
+
 ## 视频（可选，和语音并行）
 
 前端可以在通话中随时开关摄像头，不断线：
 
 | 方向 | 消息 | 说明 |
 | --- | --- | --- |
-| 前端 → 核心 | `{"type":"start","resume":"<call_session_id>"}` | 断线接回：带上之前的编号，核心在 `PAIVOICE_RESUME_SECONDS` 秒内认得出就接着同一通（回 `state` 带 `resumed: true`） |
+| 前端 → 核心 | `{"type":"start","ticket":"<one-use-ticket>","resume":"<call_session_id>"}` | 首次连接和断线接回都必须携带新票据；重连还要带之前的编号，核心在 `PAIVOICE_RESUME_SECONDS` 秒内认得出就接着同一通（回 `state` 带 `resumed: true`） |
 | 前端 → 核心 | `{"type":"video","on":true|false}` | 开/关摄像头 |
 | 前端 → 核心 | `{"type":"frame","data":"<base64 jpeg>","ts":…}` | 实时模式每 5 秒一帧、陪伴模式每 20 秒一帧，480 宽 |
 | 前端 → 核心 | `{"type":"video_mode","mode":"live"|"companion"}` | 切实时 / 陪伴模式，不用重开摄像头 |
